@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adaptive-interaction-order"
+version = "0.1.0"
+description = "Adaptive interaction-order models for particle and set-based data"
+readme = "README.md"
+requires-python = ">=3.10"
+
+dependencies = [
+    "torch"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
