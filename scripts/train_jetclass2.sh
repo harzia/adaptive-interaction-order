@@ -1,27 +1,50 @@
 #!/bin/bash
 set -euo pipefail
 
+# ---------------------------------------------------------------------------
+# Reproducibility metadata
+# ---------------------------------------------------------------------------
+
+# Capture the exact script invocation before positional arguments are shifted.
+printf -v RUN_COMMAND '%q ' "$0" "$@"
+RUN_COMMAND="${RUN_COMMAND% }"
+export RUN_COMMAND
+
 if [[ -z "${DATA_PATH:-}" ]]; then
     echo "Error: The DATA_PATH environment variable is not set."
     exit 1
 fi
+
 if [[ -z "${OUTPUT_PATH:-}" ]]; then
     echo "Error: The OUTPUT_PATH environment variable is not set."
     exit 1
 fi
+
 if [[ -z "${COMMENT:-}" ]]; then
     echo "Error: The COMMENT environment variable is not set."
     exit 1
 fi
 
+RUN_COMMENT="${COMMENT}"
+export RUN_COMMENT
+
+echo "command: ${RUN_COMMAND}"
+echo "comment: ${RUN_COMMENT}"
+
+# ---------------------------------------------------------------------------
+# Dataset / output locations
+# ---------------------------------------------------------------------------
+
 # Expected layout:
-#   ${DATA_PATH}/JetClassII/Pythia/Res2P_0000.parquet
-#   ${DATA_PATH}/JetClassII/Pythia/Res34P_0000.parquet
-#   ${DATA_PATH}/JetClassII/Pythia/QCD_0000.parquet
-DATADIR="${DATA_PATH}/JetClassII/Pythia"
+#   ${DATA_PATH}/JetClass2/Pythia/data/Res2P_0000.parquet
+#   ${DATA_PATH}/JetClass2/Pythia/data/Res34P_0000.parquet
+#   ${DATA_PATH}/JetClass2/Pythia/data/QCD_0000.parquet
+DATADIR="${DATA_PATH}/JetClass2/Pythia/data"
 OUTPUT_VOL_DIR="${OUTPUT_PATH}"
 
-echo "args: $*"
+# ---------------------------------------------------------------------------
+# Model / feature selection
+# ---------------------------------------------------------------------------
 
 MODEL_NAME=${1:-}
 if ! [[ "${MODEL_NAME}" =~ ^(ParT|AdaParT)$ ]]; then
@@ -31,18 +54,25 @@ fi
 shift
 
 if [[ -z "${1:-}" ]] || [[ "${1:-}" == --* ]]; then
-    echo "Error: The second argument must be the feature type (e.g., full, kin, kinpid)."
+    echo "Error: The second argument must be the feature type (full, kin, kinpid)."
     exit 1
 fi
+
 FEATURE_TYPE=$1
 shift
+
 if ! [[ "${FEATURE_TYPE}" =~ ^(full|kin|kinpid)$ ]]; then
     echo "Invalid feature type ${FEATURE_TYPE}!"
     exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# Script-specific arguments
+# ---------------------------------------------------------------------------
+
 TRAIN_PERCENTAGE=100
 WEAVER_ARGS=()
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --train-percentage)
@@ -60,64 +90,66 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if ! [[ "${TRAIN_PERCENTAGE}" =~ ^[0-9]+$ ]] || (( TRAIN_PERCENTAGE < 1 || TRAIN_PERCENTAGE > 100 )); then
+if ! [[ "${TRAIN_PERCENTAGE}" =~ ^[0-9]+$ ]] \
+    || (( TRAIN_PERCENTAGE < 1 || TRAIN_PERCENTAGE > 100 )); then
     echo "Error: --train-percentage must be an integer from 1 to 100."
     exit 1
 fi
+
+# ---------------------------------------------------------------------------
+# DDP / Weaver command
+# ---------------------------------------------------------------------------
 
 suffix=${COMMENT}
 NGPUS=${DDP_NGPUS:-1}
 
 if (( NGPUS > 1 )); then
-    CMD=(torchrun --standalone --nnodes=1 --nproc_per_node="${NGPUS}" "$(command -v weaver)" --backend nccl)
+    CMD=(
+        torchrun
+        --standalone
+        --nnodes=1
+        --nproc_per_node="${NGPUS}"
+        "$(command -v weaver)"
+        --backend nccl
+    )
 else
     CMD=(weaver)
 fi
 
-# JetClass-II's official Weaver recipe uses more workers and a split data loader.
-NUM_WORKERS=${NUM_WORKERS:-5}
-if (( TRAIN_PERCENTAGE == 1 )); then
-    NUM_WORKERS=1
-fi
-
-# Keep the original training length, but use the same full-dataset samples/epoch
-# normalization as the JetClass-II reference recipe (10.24M at 100%).
-epochs=${EPOCHS:-50}
-samples_per_epoch=$(( TRAIN_PERCENTAGE * 1000 * 1024 / (10 * NGPUS) ))
+epochs=${EPOCHS:-80}
+samples_per_epoch=$(( TRAIN_PERCENTAGE * 10000 * 1024 / (100 * NGPUS) ))
 samples_per_epoch_val=$(( 2500 * 1024 ))
 
-DATA_OPTS=(--num-workers "${NUM_WORKERS}" --fetch-step 1.0 --data-split-num 200)
-BATCH_OPTS=(--batch-size 512 --start-lr 1e-3)
+NUM_WORKERS=${NUM_WORKERS:-5}
 
-# JetClass-II has 188 classes. Override with JETCLASS2_NUM_CLASSES if needed.
+DATA_OPTS=(
+    --num-workers "${NUM_WORKERS}"
+    --fetch-step 1.0
+    --data-split-num 200
+)
+
+BATCH_OPTS=(
+    --batch-size 512
+    --start-lr 5e-4
+)
+
 NUM_CLASSES=${JETCLASS2_NUM_CLASSES:-188}
-MODEL_OPTS=("model/${MODEL_NAME}.py" --use-amp --amp-dtype bf16 -o num_classes "${NUM_CLASSES}")
 
-# Allow an explicit config path. Otherwise try the repository layouts commonly
-# used by this project and by the public Sophon/JetClass-II reference code.
-if [[ -n "${JETCLASS2_CONFIG:-}" ]]; then
-    DATA_CONFIG="${JETCLASS2_CONFIG}"
-else
-    CONFIG_CANDIDATES=(
-        "dataset/JetClassII/JetClassII_${FEATURE_TYPE}.yaml"
-        "data/JetClassII/JetClassII_${FEATURE_TYPE}.yaml"
-    )
-    DATA_CONFIG=""
-    for cfg in "${CONFIG_CANDIDATES[@]}"; do
-        if [[ -f "${cfg}" ]]; then
-            DATA_CONFIG="${cfg}"
-            break
-        fi
-    done
-    if [[ -z "${DATA_CONFIG}" ]]; then
-        echo "Error: Could not find a JetClass-II data config for feature type '${FEATURE_TYPE}'."
-        echo "Tried: ${CONFIG_CANDIDATES[*]}"
-        echo "Set JETCLASS2_CONFIG=/path/to/JetClassII_${FEATURE_TYPE}.yaml to override."
-        exit 1
-    fi
-fi
+MODEL_OPTS=(
+    "integrations/weaver/${MODEL_NAME}.py"
+    --use-amp
+    --amp-dtype bf16
+    -o num_classes "${NUM_CLASSES}"
+    -o fc_params "[(512,0.1)]"
+)
 
-RUN_DIR="${OUTPUT_VOL_DIR}/${MODEL_NAME}/JetClassII_${FEATURE_TYPE}/${suffix}"
+DATA_CONFIG="configs/datasets/jetclass2/JetClassII_${FEATURE_TYPE}.yaml"
+
+# ---------------------------------------------------------------------------
+# Output structure
+# ---------------------------------------------------------------------------
+
+RUN_DIR="${OUTPUT_VOL_DIR}/${MODEL_NAME}/JetClass2_${FEATURE_TYPE}/${suffix}"
 TRAINING_DIR="${RUN_DIR}/training"
 LOG_DIR="${RUN_DIR}/logs"
 TENSORBOARD_DIR="${RUN_DIR}/tensorboard"
@@ -131,11 +163,28 @@ mkdir -p \
     "${RESULTS_DIR}" \
     "${WANDB_DIR}"
 
-# JetClass-II file ranges (100k jets/file):
-#   train: Res2P 0000-0199, Res34P 0000-0859, QCD 0000-0279
-#   val:   Res2P 0200-0249, Res34P 0860-1074, QCD 0280-0349
-#   test:  Res2P 0250-0299, Res34P 1075-1289, QCD 0350-0419
-# For --train-percentage, take the same fraction from each training group.
+# ---------------------------------------------------------------------------
+# JetClass-II file ranges
+#
+# train:
+#   Res2P   0000-0199  (200 files)
+#   Res34P  0000-0859  (860 files)
+#   QCD     0000-0279  (280 files)
+#
+# validation:
+#   Res2P   0200-0249
+#   Res34P  0860-1074
+#   QCD     0280-0349
+#
+# test:
+#   Res2P   0250-0299
+#   Res34P  1075-1289
+#   QCD     0350-0419
+#
+# --train-percentage independently takes the same percentage from each
+# training category. Validation and test sets are unchanged.
+# ---------------------------------------------------------------------------
+
 count_for_percentage() {
     local total=$1
     echo $(( (total * TRAIN_PERCENTAGE + 99) / 100 ))
@@ -148,6 +197,7 @@ append_labelled_range() {
     local start=$4
     local end=$5
     local i
+
     for (( i=start; i<=end; i++ )); do
         printf -v idx '%04d' "${i}"
         out+=("${label}:${DATADIR}/${prefix}_${idx}.parquet")
@@ -160,6 +210,7 @@ append_plain_range() {
     local start=$3
     local end=$4
     local i
+
     for (( i=start; i<=end; i++ )); do
         printf -v idx '%04d' "${i}"
         out+=("${DATADIR}/${prefix}_${idx}.parquet")
@@ -186,13 +237,22 @@ append_labelled_range TEST_FILES Res2P  Res2P  250 299
 append_labelled_range TEST_FILES Res34P Res34P 1075 1289
 append_labelled_range TEST_FILES QCD    QCD    350 419
 
+
 echo "JetClass-II data dir: ${DATADIR}"
 echo "Data config: ${DATA_CONFIG}"
+echo "Model: ${MODEL_NAME}"
+echo "Feature type: ${FEATURE_TYPE}"
 echo "Training percentage: ${TRAIN_PERCENTAGE}%"
 echo "Training files: ${#TRAIN_FILES[@]} (Res2P=${N_RES2P}, Res34P=${N_RES34P}, QCD=${N_QCD})"
 echo "Validation files: ${#VAL_FILES[@]}"
 echo "Test files: ${#TEST_FILES[@]}"
 echo "Number of classes: ${NUM_CLASSES}"
+echo "Epochs: ${epochs}"
+echo "Samples/epoch/GPU-normalized: ${samples_per_epoch}"
+echo "Validation samples/epoch: ${samples_per_epoch_val}"
+echo "Batch size: 512"
+echo "Start LR: 5e-4"
+echo "GPUs: ${NGPUS}"
 
 "${CMD[@]}" \
     --data-train "${TRAIN_FILES[@]}" \
