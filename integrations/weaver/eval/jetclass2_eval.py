@@ -284,7 +284,7 @@ SIGNAL_GROUPS = {'label_X_QQ': [0, 1, 2, 3, 4, 5, 6, 7, 8],
  'label_X_YY_QQtaulv': [143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154],
  'label_X_YY_QQtauhv': [155, 156, 157, 158, 159, 160]}
 
-WORKING_POINT = 0.30
+WORKING_POINTS = (0.30, 0.50)
 
 # The full JetClass-II test set is very large, so evaluation is streamed.
 #
@@ -435,7 +435,7 @@ def evaluate_prediction_files(
       true labels 161-187;
     * stratified-sample 188-way macro one-vs-one ROC AUC;
     * signal-topology-vs-QCD AUC for the 29 JetClass-II topology groups;
-    * QCD background rejection at 30% signal efficiency for those groups.
+    * QCD background rejection at 30% and 50% signal efficiency for those groups.
 
     For a signal topology S, the binary discriminant is
 
@@ -530,7 +530,6 @@ def evaluate_prediction_files(
             where=denominator > 0,
         )
 
-        # Signal events contribute only to their own broad topology group.
         signal_mask = true_labels < QCD_START
         if np.any(signal_mask):
             signal_labels = true_labels[signal_mask]
@@ -551,7 +550,6 @@ def evaluate_prediction_files(
                 minlength=NUM_SIGNAL_GROUPS * ROC_BINS,
             ).reshape(NUM_SIGNAL_GROUPS, ROC_BINS)
 
-        # Every true QCD event is background for every signal topology.
         qcd_mask = true_labels >= QCD_START
         if np.any(qcd_mask):
             background_scores = discriminants[qcd_mask]
@@ -615,7 +613,6 @@ def evaluate_prediction_files(
         "num_qcd_events": int(class_counts[QCD_START:].sum()),
     }
 
-    # 188-way macro OVO AUC on a deterministic stratified sample.
     auc_labels, auc_probabilities = auc_sampler.finalize()
 
     if auc_labels.size > 0:
@@ -645,58 +642,80 @@ def evaluate_prediction_files(
             )
 
     rejection_rows: list[list[Any]] = []
-    plot_groups: list[str] = []
-    plot_rejections: list[float] = []
+
+    plot_rejections_by_wp: dict[float, tuple[list[str], list[float]]] = {
+        working_point: ([], [])
+        for working_point in WORKING_POINTS
+    }
+
+    plot_auc_groups: list[str] = []
     plot_aucs: list[float] = []
 
-    metric_suffix = _working_point_suffix(WORKING_POINT)
-
     for group_index, group_name in enumerate(GROUP_NAMES):
-        (
-            selected_signal_efficiency,
-            selected_background_efficiency,
-            background_rejection,
-            threshold,
-            group_auc,
-        ) = _metrics_from_histograms(
-            signal_hist[group_index],
-            qcd_hist[group_index],
-            WORKING_POINT,
-        )
-
         display_name = _display_name(group_name)
 
-        metrics[
-            f"rejection_{display_name}_at_{metric_suffix}"
-        ] = background_rejection
-        metrics[
-            f"auc_{display_name}_vs_QCD"
-        ] = group_auc
+        group_auc: float | None = None
 
-        rejection_rows.append(
-            [
-                display_name,
-                int(signal_hist[group_index].sum()),
-                int(qcd_hist[group_index].sum()),
-                float(WORKING_POINT),
+        for working_point in WORKING_POINTS:
+            (
                 selected_signal_efficiency,
                 selected_background_efficiency,
                 background_rejection,
                 threshold,
-                group_auc,
-            ]
-        )
+                this_group_auc,
+            ) = _metrics_from_histograms(
+                signal_hist[group_index],
+                qcd_hist[group_index],
+                working_point,
+            )
 
-        if background_rejection is not None:
-            plot_groups.append(display_name)
-            plot_rejections.append(
-                float(background_rejection)
+            if group_auc is None:
+                group_auc = this_group_auc
+
+            metric_suffix = _working_point_suffix(
+                working_point
             )
-            plot_aucs.append(
-                float(group_auc)
-                if group_auc is not None
-                else float("nan")
+
+            metrics[
+                f"rejection_{display_name}_at_{metric_suffix}"
+            ] = background_rejection
+
+            rejection_rows.append(
+                [
+                    display_name,
+                    int(signal_hist[group_index].sum()),
+                    int(qcd_hist[group_index].sum()),
+                    float(working_point),
+                    selected_signal_efficiency,
+                    selected_background_efficiency,
+                    background_rejection,
+                    threshold,
+                    group_auc,
+                ]
             )
+
+            if background_rejection is not None:
+                (
+                    plot_groups_for_wp,
+                    plot_values_for_wp,
+                ) = plot_rejections_by_wp[
+                    working_point
+                ]
+
+                plot_groups_for_wp.append(
+                    display_name
+                )
+                plot_values_for_wp.append(
+                    float(background_rejection)
+                )
+
+        metrics[
+            f"auc_{display_name}_vs_QCD"
+        ] = group_auc
+
+        if group_auc is not None:
+            plot_auc_groups.append(display_name)
+            plot_aucs.append(float(group_auc))
 
     class_count_rows = [
         [
@@ -722,20 +741,35 @@ def evaluate_prediction_files(
 
     plots: dict[str, dict[str, Any]] = {}
 
-    if plot_groups:
-        plots["background_rejection"] = {
-            "type": "bar",
-            "title": "JetClass-II QCD rejection at 30% signal efficiency",
-            "x": plot_groups,
-            "y": plot_rejections,
-            "x_label": "Signal topology",
-            "y_label": "QCD background rejection",
-        }
+    for working_point in WORKING_POINTS:
+        (
+            plot_groups_for_wp,
+            plot_values_for_wp,
+        ) = plot_rejections_by_wp[
+            working_point
+        ]
 
+        if plot_groups_for_wp:
+            percentage = int(round(working_point * 100))
+            plots[
+                f"background_rejection_{percentage}pct"
+            ] = {
+                "type": "bar",
+                "title": (
+                    "JetClass-II QCD rejection at "
+                    f"{percentage}% signal efficiency"
+                ),
+                "x": plot_groups_for_wp,
+                "y": plot_values_for_wp,
+                "x_label": "Signal topology",
+                "y_label": "QCD background rejection",
+            }
+
+    if plot_auc_groups:
         plots["signal_vs_qcd_auc"] = {
             "type": "bar",
             "title": "JetClass-II signal-topology vs QCD AUC",
-            "x": plot_groups,
+            "x": plot_auc_groups,
             "y": plot_aucs,
             "x_label": "Signal topology",
             "y_label": "ROC AUC",
@@ -773,9 +807,6 @@ def evaluate_prediction_files(
         "plots": plots,
     }
 
-    # Weaver may create multiple prediction ROOT files (e.g. one per named
-    # test group). Derive the common output directory from the actual files
-    # supplied to this evaluation hook and write one consolidated metrics file.
     prediction_paths = [
         Path(file_path).resolve()
         for file_path in prediction_files.values()
@@ -821,8 +852,6 @@ def evaluate_prediction_files(
             ),
         },
         "run": {
-            # Exported by train_jetclass2.sh before Weaver starts.
-            # If the evaluator is run independently, either field may be null.
             "command": os.environ.get("RUN_COMMAND"),
             "comment": os.environ.get(
                 "RUN_COMMENT",
@@ -839,9 +868,9 @@ def evaluate_prediction_files(
                 "qcd": [QCD_START, NUM_CLASSES - 1],
             },
             "num_signal_groups": NUM_SIGNAL_GROUPS,
-            "signal_working_point": WORKING_POINT,
+            "signal_working_points": list(WORKING_POINTS),
             "background_rejection_definition": (
-                "1 / QCD efficiency at the selected signal working point"
+                "1 / QCD efficiency at each selected signal working point"
             ),
             "signal_vs_qcd_score": (
                 "p(signal_group) / "
@@ -953,8 +982,6 @@ def _iter_prediction_chunks(
 def _as_probability_matrix(values: np.ndarray) -> np.ndarray:
     probabilities = np.asarray(values)
 
-    # Some ROOT layouts may be returned as an object array of fixed-length
-    # vectors rather than directly as an N x 188 ndarray.
     if probabilities.dtype == object:
         probabilities = np.stack(probabilities)
 
@@ -1003,7 +1030,6 @@ def _metrics_from_histograms(
     if num_signal == 0 or num_background == 0:
         return None, None, None, None, None
 
-    # Counts passing a threshold at the lower edge of each score bin.
     signal_tail = np.cumsum(
         signal_hist[::-1],
         dtype=np.int64,
@@ -1047,8 +1073,6 @@ def _metrics_from_histograms(
         else None
     )
 
-    # Histogram approximation to AUC = P(score_signal > score_background),
-    # with half credit for ties within the same score bin.
     background_below = (
         np.cumsum(background_hist, dtype=np.int64)
         - background_hist
