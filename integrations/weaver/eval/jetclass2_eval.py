@@ -314,6 +314,126 @@ if np.any(CLASS_TO_GROUP < 0):
     raise RuntimeError("JetClass-II signal groups do not cover labels 0-160.")
 
 
+THREE_PRONG_GROUP_NAMES = [
+    "label_X_YY_QQQ",
+    "label_X_YY_QQg",
+    "label_X_YY_Qgg",
+    "label_X_YY_ggg",
+    "label_X_YY_QQl",
+    "label_X_YY_Qll",
+    "label_X_YY_Qtauhtaul",
+    "label_X_YY_Qtauhtauh",
+    "label_X_YY_ggl",
+    "label_X_YY_gll",
+    "label_X_YY_gtauhtaul",
+    "label_X_YY_gtauhtauh",
+    "label_X_YY_QQlv",
+    "label_X_YY_QQtaulv",
+    "label_X_YY_QQtauhv",
+]
+
+FOUR_PRONG_GROUP_NAMES = [
+    "label_X_YY_QQQQ",
+    "label_X_YY_QQgg",
+    "label_X_YY_gggg",
+    "label_X_YY_QQll",
+    "label_X_YY_QQtauhtaul",
+    "label_X_YY_QQtauhtauh",
+    "label_X_YY_ggll",
+    "label_X_YY_ggtauhtaul",
+    "label_X_YY_ggtauhtauh",
+]
+
+THREE_PRONG_INDICES = np.asarray(
+    sorted(
+        index
+        for group_name in THREE_PRONG_GROUP_NAMES
+        for index in SIGNAL_GROUPS[group_name]
+    ),
+    dtype=np.int64,
+)
+
+FOUR_PRONG_INDICES = np.asarray(
+    sorted(
+        index
+        for group_name in FOUR_PRONG_GROUP_NAMES
+        for index in SIGNAL_GROUPS[group_name]
+    ),
+    dtype=np.int64,
+)
+
+if set(THREE_PRONG_INDICES) & set(FOUR_PRONG_INDICES):
+    raise RuntimeError("3-prong and 4-prong JetClass-II taxonomies overlap.")
+
+if (
+    set(THREE_PRONG_INDICES)
+    | set(FOUR_PRONG_INDICES)
+) != set(range(RES34P_START, RES34P_END)):
+    raise RuntimeError(
+        "3-prong and 4-prong taxonomies do not exactly cover labels 15-160."
+    )
+
+
+PAIR_DEFINITIONS = {
+    "X_bb_vs_QCD_bb": {
+        "signal_indices": np.asarray([0], dtype=np.int64),
+        "background_indices": np.asarray([169], dtype=np.int64),
+        "role": "colour-flow test",
+        "description": (
+            "X->bb (class 0) versus QCD_bb (class 169): same prongs, "
+            "same flavour, resonance-vs-QCD colour-flow benchmark."
+        ),
+    },
+    "X_qq_vs_X_gg": {
+        "signal_indices": np.asarray([3], dtype=np.int64),
+        "background_indices": np.asarray([9], dtype=np.int64),
+        "role": "2-prong colour-charge test",
+        "description": (
+            "X->qq (class 3) versus X->gg (class 9): 2-prong "
+            "colour-charge benchmark."
+        ),
+    },
+    "X_YY_qqqq_vs_X_YY_gggg": {
+        "signal_indices": np.asarray([63], dtype=np.int64),
+        "background_indices": np.asarray([77], dtype=np.int64),
+        "role": "4-prong colour-structure test",
+        "description": (
+            "X_YY->qqqq (class 63) versus X_YY->gggg (class 77): "
+            "4-prong colour-structure benchmark."
+        ),
+    },
+    "X_bb_vs_X_cc": {
+        "signal_indices": np.asarray([0], dtype=np.int64),
+        "background_indices": np.asarray([1], dtype=np.int64),
+        "role": "negative control",
+        "description": (
+            "X->bb (class 0) versus X->cc (class 1): flavour negative control."
+        ),
+    },
+}
+
+PAIR_NAMES = list(PAIR_DEFINITIONS)
+NUM_PAIRS = len(PAIR_NAMES)
+
+_EXPECTED_PAIR_CLASS_NAMES = {
+    0: "label_X_bb",
+    1: "label_X_cc",
+    3: "label_X_qq",
+    9: "label_X_gg",
+    63: "label_X_YY_qqqq",
+    77: "label_X_YY_gggg",
+    169: "label_QCD_bb",
+}
+
+for class_index, expected_name in _EXPECTED_PAIR_CLASS_NAMES.items():
+    if CLASS_NAMES[class_index] != expected_name:
+        raise RuntimeError(
+            "JetClass-II class ordering mismatch for pair benchmarks: "
+            f"class {class_index} is {CLASS_NAMES[class_index]!r}, "
+            f"expected {expected_name!r}."
+        )
+
+
 class _StratifiedScoreSampler:
     """Keep a deterministic uniform sample of score vectors for each class."""
 
@@ -460,6 +580,15 @@ def evaluate_prediction_files(
         dtype=np.int64,
     )
 
+    pair_signal_hist = np.zeros(
+        (NUM_PAIRS, ROC_BINS),
+        dtype=np.int64,
+    )
+    pair_background_hist = np.zeros(
+        (NUM_PAIRS, ROC_BINS),
+        dtype=np.int64,
+    )
+
     class_counts = np.zeros(NUM_CLASSES, dtype=np.int64)
     class_correct_counts = np.zeros(NUM_CLASSES, dtype=np.int64)
     correct_events = 0
@@ -530,6 +659,7 @@ def evaluate_prediction_files(
             where=denominator > 0,
         )
 
+        # Signal events contribute only to their own broad topology group.
         signal_mask = true_labels < QCD_START
         if np.any(signal_mask):
             signal_labels = true_labels[signal_mask]
@@ -550,6 +680,7 @@ def evaluate_prediction_files(
                 minlength=NUM_SIGNAL_GROUPS * ROC_BINS,
             ).reshape(NUM_SIGNAL_GROUPS, ROC_BINS)
 
+        # Every true QCD event is background for every signal topology.
         qcd_mask = true_labels >= QCD_START
         if np.any(qcd_mask):
             background_scores = discriminants[qcd_mask]
@@ -570,6 +701,44 @@ def evaluate_prediction_files(
                 minlength=NUM_SIGNAL_GROUPS * ROC_BINS,
             ).reshape(NUM_SIGNAL_GROUPS, ROC_BINS)
 
+        for pair_index, pair_name in enumerate(PAIR_NAMES):
+            definition = PAIR_DEFINITIONS[pair_name]
+            signal_indices = definition["signal_indices"]
+            background_indices = definition["background_indices"]
+
+            signal_probability = probabilities[:, signal_indices].sum(axis=1)
+            background_probability = probabilities[
+                :,
+                background_indices,
+            ].sum(axis=1)
+
+            pair_denominator = signal_probability + background_probability
+            pair_scores = np.divide(
+                signal_probability,
+                pair_denominator,
+                out=np.zeros_like(signal_probability, dtype=np.float32),
+                where=pair_denominator > 0,
+            )
+
+            pair_signal_mask = np.isin(true_labels, signal_indices)
+            if np.any(pair_signal_mask):
+                bins = _score_bins(pair_scores[pair_signal_mask])
+                pair_signal_hist[pair_index] += np.bincount(
+                    bins,
+                    minlength=ROC_BINS,
+                )
+
+            pair_background_mask = np.isin(
+                true_labels,
+                background_indices,
+            )
+            if np.any(pair_background_mask):
+                bins = _score_bins(pair_scores[pair_background_mask])
+                pair_background_hist[pair_index] += np.bincount(
+                    bins,
+                    minlength=ROC_BINS,
+                )
+
     if num_events == 0:
         raise ValueError("Prediction files contained no events.")
 
@@ -588,31 +757,42 @@ def evaluate_prediction_files(
         else None
     )
 
-    def _range_accuracy(start: int, end: int) -> float | None:
-        count = int(class_counts[start:end].sum())
+    def _index_accuracy(indices: np.ndarray) -> float | None:
+        count = int(class_counts[indices].sum())
         if count == 0:
             return None
-        correct = int(class_correct_counts[start:end].sum())
+        correct = int(class_correct_counts[indices].sum())
         return float(correct / count)
 
-    accuracy_2prong = _range_accuracy(0, RES2P_END)
-    accuracy_34prong = _range_accuracy(RES34P_START, RES34P_END)
-    accuracy_qcd = _range_accuracy(QCD_START, NUM_CLASSES)
+    two_prong_indices = np.arange(0, RES2P_END, dtype=np.int64)
+    combined_34_indices = np.arange(
+        RES34P_START,
+        RES34P_END,
+        dtype=np.int64,
+    )
+    qcd_indices = np.arange(QCD_START, NUM_CLASSES, dtype=np.int64)
+
+    accuracy_2prong = _index_accuracy(two_prong_indices)
+    accuracy_3prong = _index_accuracy(THREE_PRONG_INDICES)
+    accuracy_4prong = _index_accuracy(FOUR_PRONG_INDICES)
+    accuracy_34prong = _index_accuracy(combined_34_indices)
+    accuracy_qcd = _index_accuracy(qcd_indices)
 
     metrics: dict[str, float | int | None] = {
         "accuracy_top1": float(accuracy_top1),
         "accuracy_macro": accuracy_macro,
         "accuracy_2prong": accuracy_2prong,
-        "accuracy_34prong": accuracy_34prong,
+        "accuracy_3prong": accuracy_3prong,
+        "accuracy_4prong": accuracy_4prong,
         "accuracy_qcd": accuracy_qcd,
         "num_events": int(num_events),
-        "num_2prong_events": int(class_counts[:RES2P_END].sum()),
-        "num_34prong_events": int(
-            class_counts[RES34P_START:RES34P_END].sum()
-        ),
-        "num_qcd_events": int(class_counts[QCD_START:].sum()),
+        "num_2prong_events": int(class_counts[two_prong_indices].sum()),
+        "num_3prong_events": int(class_counts[THREE_PRONG_INDICES].sum()),
+        "num_4prong_events": int(class_counts[FOUR_PRONG_INDICES].sum()),
+        "num_qcd_events": int(class_counts[qcd_indices].sum()),
     }
 
+    # 188-way macro OVO AUC on a deterministic stratified sample.
     auc_labels, auc_probabilities = auc_sampler.finalize()
 
     if auc_labels.size > 0:
@@ -626,34 +806,38 @@ def evaluate_prediction_files(
                 multi_class="ovo",
                 labels=np.arange(NUM_CLASSES),
             )
-            metrics["overall_auc_macro_ovo_sampled"] = float(
-                overall_auc
-            )
-            metrics["overall_auc_num_events"] = int(
-                auc_labels.size
-            )
-            metrics["overall_auc_samples_per_class"] = int(
-                AUC_SAMPLES_PER_CLASS
-            )
+            metrics["auc_macro_ovo"] = float(overall_auc)
         else:
-            metrics["overall_auc_macro_ovo_sampled"] = None
-            metrics["overall_auc_num_events"] = int(
-                auc_labels.size
-            )
+            metrics["auc_macro_ovo"] = None
+
+    metrics.setdefault("auc_macro_ovo", None)
 
     rejection_rows: list[list[Any]] = []
+    rej30_rows: list[list[Any]] = []
+    rej50_rows: list[list[Any]] = []
+    auc_group_rows: list[list[Any]] = []
 
     plot_rejections_by_wp: dict[float, tuple[list[str], list[float]]] = {
         working_point: ([], [])
         for working_point in WORKING_POINTS
     }
-
     plot_auc_groups: list[str] = []
     plot_aucs: list[float] = []
 
+    group_auc_values: list[float] = []
+    geomean_values_by_wp: dict[float, list[float]] = {
+        working_point: []
+        for working_point in WORKING_POINTS
+    }
+    censored_groups_by_wp: dict[float, int] = {
+        working_point: 0
+        for working_point in WORKING_POINTS
+    }
+
     for group_index, group_name in enumerate(GROUP_NAMES):
         display_name = _display_name(group_name)
-
+        num_signal_group = int(signal_hist[group_index].sum())
+        num_qcd_group = int(qcd_hist[group_index].sum())
         group_auc: float | None = None
 
         for working_point in WORKING_POINTS:
@@ -672,50 +856,131 @@ def evaluate_prediction_files(
             if group_auc is None:
                 group_auc = this_group_auc
 
-            metric_suffix = _working_point_suffix(
-                working_point
-            )
+            percentage = int(round(100 * working_point))
 
             metrics[
-                f"rejection_{display_name}_at_{metric_suffix}"
+                f"rej{percentage}_per_group/{display_name}"
             ] = background_rejection
 
-            rejection_rows.append(
-                [
-                    display_name,
-                    int(signal_hist[group_index].sum()),
-                    int(qcd_hist[group_index].sum()),
-                    float(working_point),
-                    selected_signal_efficiency,
-                    selected_background_efficiency,
-                    background_rejection,
-                    threshold,
-                    group_auc,
-                ]
+            if background_rejection is None:
+                if (
+                    num_signal_group > 0
+                    and num_qcd_group > 0
+                    and selected_background_efficiency == 0.0
+                ):
+                    geomean_value = float(num_qcd_group)
+                    censored_groups_by_wp[working_point] += 1
+                else:
+                    geomean_value = float("nan")
+            else:
+                geomean_value = float(background_rejection)
+
+            geomean_values_by_wp[working_point].append(
+                geomean_value
             )
 
+            row = [
+                display_name,
+                num_signal_group,
+                num_qcd_group,
+                float(working_point),
+                selected_signal_efficiency,
+                selected_background_efficiency,
+                background_rejection,
+                geomean_value if np.isfinite(geomean_value) else None,
+                threshold,
+                group_auc,
+            ]
+            rejection_rows.append(row)
+            if percentage == 30:
+                rej30_rows.append(row)
+            elif percentage == 50:
+                rej50_rows.append(row)
+
             if background_rejection is not None:
-                (
-                    plot_groups_for_wp,
-                    plot_values_for_wp,
-                ) = plot_rejections_by_wp[
-                    working_point
-                ]
-
-                plot_groups_for_wp.append(
-                    display_name
+                plot_groups_for_wp, plot_values_for_wp = (
+                    plot_rejections_by_wp[working_point]
                 )
-                plot_values_for_wp.append(
-                    float(background_rejection)
-                )
+                plot_groups_for_wp.append(display_name)
+                plot_values_for_wp.append(float(background_rejection))
 
-        metrics[
-            f"auc_{display_name}_vs_QCD"
-        ] = group_auc
+        metrics[f"auc_group_vs_qcd/{display_name}"] = group_auc
+        auc_group_rows.append(
+            [
+                display_name,
+                num_signal_group,
+                num_qcd_group,
+                group_auc,
+            ]
+        )
 
         if group_auc is not None:
+            group_auc_values.append(float(group_auc))
             plot_auc_groups.append(display_name)
             plot_aucs.append(float(group_auc))
+
+    metrics["auc_group_vs_qcd_macro"] = (
+        float(np.mean(group_auc_values))
+        if len(group_auc_values) == NUM_SIGNAL_GROUPS
+        else None
+    )
+
+    for working_point in WORKING_POINTS:
+        percentage = int(round(100 * working_point))
+        values = np.asarray(
+            geomean_values_by_wp[working_point],
+            dtype=np.float64,
+        )
+        if (
+            values.size == NUM_SIGNAL_GROUPS
+            and np.all(np.isfinite(values))
+            and np.all(values > 0)
+        ):
+            metrics[f"rej{percentage}_geomean"] = float(
+                np.exp(np.mean(np.log(values)))
+            )
+        else:
+            metrics[f"rej{percentage}_geomean"] = None
+
+        metrics[
+            f"rej{percentage}_geomean_num_censored_groups"
+        ] = int(censored_groups_by_wp[working_point])
+
+    pair_rows: list[list[Any]] = []
+    for pair_index, pair_name in enumerate(PAIR_NAMES):
+        (
+            selected_signal_efficiency,
+            selected_background_efficiency,
+            pair_rejection,
+            threshold,
+            pair_auc,
+        ) = _metrics_from_histograms(
+            pair_signal_hist[pair_index],
+            pair_background_hist[pair_index],
+            0.50,
+        )
+
+        metrics[f"rej50_pairs/{pair_name}"] = pair_rejection
+
+        definition = PAIR_DEFINITIONS[pair_name]
+        pair_rows.append(
+            [
+                pair_name,
+                definition["role"],
+                definition["description"],
+                int(pair_signal_hist[pair_index].sum()),
+                int(pair_background_hist[pair_index].sum()),
+                0.50,
+                selected_signal_efficiency,
+                selected_background_efficiency,
+                pair_rejection,
+                threshold,
+                pair_auc,
+            ]
+        )
+
+    three_prong_set = set(THREE_PRONG_INDICES.tolist())
+    four_prong_set = set(FOUR_PRONG_INDICES.tolist())
 
     class_count_rows = [
         [
@@ -731,8 +996,10 @@ def evaluate_prediction_files(
             (
                 "QCD"
                 if class_index >= QCD_START
-                else "3/4-prong"
-                if class_index >= RES34P_START
+                else "4-prong"
+                if class_index in four_prong_set
+                else "3-prong"
+                if class_index in three_prong_set
                 else "2-prong"
             ),
         ]
@@ -787,10 +1054,66 @@ def evaluate_prediction_files(
                     "selected_signal_efficiency",
                     "background_efficiency",
                     "background_rejection",
+                    "geomean_capped_rejection",
                     "threshold",
                     "auc_vs_qcd",
                 ],
                 "data": rejection_rows,
+            },
+            "rej50_per_group": {
+                "columns": [
+                    "signal_group",
+                    "num_signal_events",
+                    "num_qcd_events",
+                    "target_signal_efficiency",
+                    "selected_signal_efficiency",
+                    "background_efficiency",
+                    "background_rejection",
+                    "geomean_capped_rejection",
+                    "threshold",
+                    "auc_vs_qcd",
+                ],
+                "data": rej50_rows,
+            },
+            "rej30_per_group": {
+                "columns": [
+                    "signal_group",
+                    "num_signal_events",
+                    "num_qcd_events",
+                    "target_signal_efficiency",
+                    "selected_signal_efficiency",
+                    "background_efficiency",
+                    "background_rejection",
+                    "geomean_capped_rejection",
+                    "threshold",
+                    "auc_vs_qcd",
+                ],
+                "data": rej30_rows,
+            },
+            "auc_group_vs_qcd": {
+                "columns": [
+                    "signal_group",
+                    "num_signal_events",
+                    "num_qcd_events",
+                    "auc_vs_qcd",
+                ],
+                "data": auc_group_rows,
+            },
+            "rej50_pairs": {
+                "columns": [
+                    "pair",
+                    "role",
+                    "description",
+                    "num_signal_events",
+                    "num_background_events",
+                    "target_signal_efficiency",
+                    "selected_signal_efficiency",
+                    "background_efficiency",
+                    "background_rejection",
+                    "threshold",
+                    "auc",
+                ],
+                "data": pair_rows,
             },
             "class_counts": {
                 "columns": [
@@ -807,6 +1130,9 @@ def evaluate_prediction_files(
         "plots": plots,
     }
 
+    # Weaver may create multiple prediction ROOT files (e.g. one per named
+    # test group). Derive the common output directory from the actual files
+    # supplied to this evaluation hook and write one consolidated metrics file.
     prediction_paths = [
         Path(file_path).resolve()
         for file_path in prediction_files.values()
@@ -852,6 +1178,8 @@ def evaluate_prediction_files(
             ),
         },
         "run": {
+            # Exported by train_jetclass2.sh before Weaver starts.
+            # If the evaluator is run independently, either field may be null.
             "command": os.environ.get("RUN_COMMAND"),
             "comment": os.environ.get(
                 "RUN_COMMENT",
@@ -862,15 +1190,25 @@ def evaluate_prediction_files(
         },
         "evaluation": {
             "num_classes": NUM_CLASSES,
-            "class_ranges": {
-                "2prong": [0, RES2P_END - 1],
-                "34prong": [RES34P_START, RES34P_END - 1],
-                "qcd": [QCD_START, NUM_CLASSES - 1],
+            "class_taxonomy": {
+                "2prong_indices": list(range(0, RES2P_END)),
+                "3prong_indices": THREE_PRONG_INDICES.tolist(),
+                "4prong_indices": FOUR_PRONG_INDICES.tolist(),
+                "qcd_indices": list(range(QCD_START, NUM_CLASSES)),
+                "note": (
+                    "3-prong/4-prong are nominal label-taxonomy categories, "
+                    "not reconstructed event-by-event prong counts."
+                ),
             },
             "num_signal_groups": NUM_SIGNAL_GROUPS,
             "signal_working_points": list(WORKING_POINTS),
             "background_rejection_definition": (
                 "1 / QCD efficiency at each selected signal working point"
+            ),
+            "geomean_censoring": (
+                "For rej30_geomean and rej50_geomean only, groups with zero "
+                "surviving QCD events are capped at the one-event test "
+                "resolution N_QCD. Raw per-group rejection remains null."
             ),
             "signal_vs_qcd_score": (
                 "p(signal_group) / "
@@ -878,9 +1216,27 @@ def evaluate_prediction_files(
             ),
             "overall_auc": {
                 "metric": "macro one-vs-one ROC AUC",
+                "output_metric_name": "auc_macro_ovo",
                 "sampled": True,
                 "samples_per_class": AUC_SAMPLES_PER_CLASS,
                 "random_seed": AUC_RANDOM_SEED,
+            },
+            "pair_benchmarks": {
+                "score": "p(S1) / (p(S1) + p(S2))",
+                "working_point": 0.50,
+                "definitions": {
+                    pair_name: {
+                        "role": PAIR_DEFINITIONS[pair_name]["role"],
+                        "description": PAIR_DEFINITIONS[pair_name]["description"],
+                        "signal_indices": PAIR_DEFINITIONS[pair_name][
+                            "signal_indices"
+                        ].tolist(),
+                        "background_indices": PAIR_DEFINITIONS[pair_name][
+                            "background_indices"
+                        ].tolist(),
+                    }
+                    for pair_name in PAIR_NAMES
+                },
             },
             "roc_histogram_bins": ROC_BINS,
             "root_step_size": STEP_SIZE,
@@ -982,6 +1338,8 @@ def _iter_prediction_chunks(
 def _as_probability_matrix(values: np.ndarray) -> np.ndarray:
     probabilities = np.asarray(values)
 
+    # Some ROOT layouts may be returned as an object array of fixed-length
+    # vectors rather than directly as an N x 188 ndarray.
     if probabilities.dtype == object:
         probabilities = np.stack(probabilities)
 
@@ -1030,6 +1388,7 @@ def _metrics_from_histograms(
     if num_signal == 0 or num_background == 0:
         return None, None, None, None, None
 
+    # Counts passing a threshold at the lower edge of each score bin.
     signal_tail = np.cumsum(
         signal_hist[::-1],
         dtype=np.int64,
@@ -1073,6 +1432,8 @@ def _metrics_from_histograms(
         else None
     )
 
+    # Histogram approximation to AUC = P(score_signal > score_background),
+    # with half credit for ties within the same score bin.
     background_below = (
         np.cumsum(background_hist, dtype=np.int64)
         - background_hist
