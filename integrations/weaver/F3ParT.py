@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from collections import Counter, defaultdict
+from functools import partial
 
 import awkward as ak
 import matplotlib as mpl
@@ -66,8 +67,23 @@ class AIOParticleTransformerWrapper(torch.nn.Module):
 
         return torch.cat([output, x_cls], dim=1)
 
+    @torch.no_grad()
+    def calibrate(self, points, features, lorentz_vectors, mask, target=1.0, force=False):
+        del points
+
+        return self.mod.calibrate(
+            features,
+            v=lorentz_vectors,
+            mask=mask,
+            target=target,
+            force=force,
+        )
+
 
 def get_model(data_config, **kwargs):
+    kwargs.pop("auto_calibrate", None)
+    kwargs.pop("calibration_target", None)
+    
     cfg = dict(
         input_dim=len(
             data_config.input_dicts["pf_features"]
@@ -153,8 +169,24 @@ def get_loss(data_config, **kwargs):
 
 
 def get_train_fn(data_config, **kwargs):
-    del data_config, kwargs
-    return train_classification
+    del data_config
+    auto_calibrate = bool(
+        kwargs.get(
+            "auto_calibrate",
+            True,
+        )
+    )
+    calibration_target = float(
+        kwargs.get(
+            "calibration_target",
+            1.0,
+        )
+    )
+    return partial(
+        train_classification_with_f3_calibration,
+        auto_calibrate=auto_calibrate,
+        calibration_target=calibration_target,
+    )
 
 
 def get_evaluate_fn(data_config, **kwargs):
@@ -717,4 +749,282 @@ def evaluate_classification_lean(
         scores,
         labels,
         observers,
+    )
+
+class _ReplayFirstBatchLoader:
+    """
+    Loader facade that replays the batch used for calibration and then
+    continues from the already-created DataLoader iterator.
+
+    This prevents calibration from consuming an extra training batch.
+    """
+
+    def __init__(
+        self,
+        first_batch,
+        remaining_iterator,
+        original_loader,
+    ):
+        self.first_batch = first_batch
+        self.remaining_iterator = remaining_iterator
+        self.original_loader = original_loader
+
+        # Weaver's stock training function reads this.
+        self.dataset = original_loader.dataset
+
+    def __iter__(self):
+        yield self.first_batch
+        yield from self.remaining_iterator
+
+    def __len__(self):
+        return len(self.original_loader)
+
+
+def _unwrap_model(model):
+    while True:
+        if hasattr(model, "module"):
+            model = model.module
+            continue
+
+        if hasattr(model, "_orig_mod"):
+            model = model._orig_mod
+            continue
+
+        return model
+
+
+def _format_calibration_report(report):
+    formatted = {}
+
+    for key, value in report.items():
+        if torch.is_tensor(value):
+            value = value.detach().cpu()
+
+            if value.numel() == 1:
+                formatted[key] = float(value.item())
+            else:
+                formatted[key] = value.tolist()
+        else:
+            formatted[key] = value
+
+    return formatted
+
+
+def train_classification_with_f3_calibration(
+    model,
+    loss_func,
+    opt,
+    scheduler,
+    train_loader,
+    dev,
+    epoch,
+    steps_per_epoch=None,
+    grad_scaler=None,
+    tb_helper=None,
+    extra_args=None,
+    *,
+    auto_calibrate=True,
+    calibration_target=1.0,
+):
+    """
+    Weaver classification loop with a one-time F3 initialization
+    calibration before the first optimizer step.
+
+    After calibration, the stock Weaver train_classification function
+    is used unchanged.
+    """
+
+    base_model = _unwrap_model(model)
+
+    if not isinstance(
+        base_model,
+        AIOParticleTransformerWrapper,
+    ):
+        raise TypeError(
+            "F3 calibration train hook expected "
+            "AIOParticleTransformerWrapper, got "
+            f"{type(base_model).__name__}."
+        )
+
+    hob = base_model.mod.hob
+
+    if not auto_calibrate:
+        return train_classification(
+            model,
+            loss_func,
+            opt,
+            scheduler,
+            train_loader,
+            dev,
+            epoch,
+            steps_per_epoch=steps_per_epoch,
+            grad_scaler=grad_scaler,
+            tb_helper=tb_helper,
+            extra_args=extra_args,
+        )
+
+    distributed = (
+        torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+    )
+
+    rank = (
+        torch.distributed.get_rank()
+        if distributed
+        else 0
+    )
+
+    calibrated = bool(
+        hob.calibrated.item()
+    )
+
+    if distributed:
+        flag = torch.tensor(
+            int(calibrated),
+            device=dev,
+            dtype=torch.int32,
+        )
+
+        torch.distributed.broadcast(
+            flag,
+            src=0,
+        )
+
+        calibrated = bool(flag.item())
+
+    if calibrated:
+        if rank == 0 and epoch == 0:
+            _logger.info(
+                "F3 calibration already present in checkpoint; "
+                "skipping initialization calibration."
+            )
+
+        return train_classification(
+            model,
+            loss_func,
+            opt,
+            scheduler,
+            train_loader,
+            dev,
+            epoch,
+            steps_per_epoch=steps_per_epoch,
+            grad_scaler=grad_scaler,
+            tb_helper=tb_helper,
+            extra_args=extra_args,
+        )
+
+    args = (
+        extra_args.get("args")
+        if extra_args is not None
+        else None
+    )
+
+    load_epoch = (
+        getattr(args, "load_epoch", None)
+        if args is not None
+        else None
+    )
+
+    if load_epoch is not None:
+        raise RuntimeError(
+            "Resumed F3 checkpoint has hob.calibrated=False. "
+            "Refusing to recalibrate a resumed trajectory. "
+            "Use a properly calibrated checkpoint or explicitly "
+            "handle this legacy checkpoint."
+        )
+
+    if epoch != 0:
+        raise RuntimeError(
+            "Reached a later epoch with an uncalibrated F3 model. "
+            "Calibration must occur before optimizer step 1."
+        )
+
+    train_iterator = iter(train_loader)
+
+    try:
+        first_batch = next(train_iterator)
+    except StopIteration as exc:
+        raise RuntimeError(
+            "Cannot calibrate F3: training loader is empty."
+        ) from exc
+
+    X, _, _ = first_batch
+
+    data_config = train_loader.dataset.config
+
+    if rank == 0:
+        _logger.info(
+            "Running one-time F3 initialization calibration "
+            "on the first real Weaver training batch."
+        )
+
+        calibration_inputs = [
+            X[name].to(
+                dev,
+                non_blocking=True,
+            )
+            for name in data_config.input_names
+        ]
+
+        report = base_model.calibrate(
+            *calibration_inputs,
+            target=calibration_target,
+        )
+
+        del calibration_inputs
+
+        _logger.info(
+            "F3 calibration report: %s",
+            _format_calibration_report(report),
+        )
+
+    if distributed:
+        for parameter in hob.parameters():
+            torch.distributed.broadcast(
+                parameter.data,
+                src=0,
+            )
+
+        for buffer in hob.buffers():
+            torch.distributed.broadcast(
+                buffer.data,
+                src=0,
+            )
+
+        torch.distributed.barrier()
+
+    if (
+        hasattr(opt, "reset")
+        and hasattr(opt, "step_counter")
+        and hasattr(opt, "k")
+        and hasattr(opt, "optimizer")
+    ):
+        opt.reset()
+        if rank == 0:
+            _logger.info("Reset Ranger/Lookahead cache after F3 calibration.")
+
+    if not bool(hob.calibrated.item()):
+        raise RuntimeError(
+            "F3 calibration synchronization failed: "
+            "hob.calibrated is still False."
+        )
+
+    replay_loader = _ReplayFirstBatchLoader(
+        first_batch,
+        train_iterator,
+        train_loader,
+    )
+
+    return train_classification(
+        model,
+        loss_func,
+        opt,
+        scheduler,
+        replay_loader,
+        dev,
+        epoch,
+        steps_per_epoch=steps_per_epoch,
+        grad_scaler=grad_scaler,
+        tb_helper=tb_helper,
+        extra_args=extra_args,
     )

@@ -6,7 +6,7 @@ Identical summed pools are computed once; pools sharing S share one base term pe
 are not i<->j invariant are evaluated on the swapped anchor and averaged; U is zero-initialised.
 """
 from __future__ import annotations
-import math
+import functools, math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 import torch, torch.nn as nn
@@ -49,22 +49,22 @@ class Motif(nn.Module):
 
     def _chunk(self, S, members, q_c, anc_c, g, n, cmask, cfac):
         b, i, j = anc_c.unbind(1)
-        t = term(S, g, n, b, i, j)                                          # [Ac,N,D]
+        sdt = torch.float32 if g.dtype in (torch.float16, torch.bfloat16) else g.dtype
+        t = term(S, g, n, b, i, j, dtype=sdt)                               # [Ac,N,D] fp32
         ar = torch.arange(t.shape[1], device=t.device)[None]
         km = cmask[b] & (ar != i[:, None]) & (ar != j[:, None])            # valid candidates k ∉ {i,j}
         Ac, N, D = t.shape; outs, stats = [], []
         for u, q in zip(members, q_c):
             if q is None:
-                w = km[..., None].to(t.dtype); stats.append(t.new_zeros(Ac, 0))
+                w = km[..., None].to(sdt); stats.append(t.new_zeros(Ac, 0))
             else:
-                sdt = torch.float32 if t.dtype in (torch.float16, torch.bfloat16) else t.dtype
-                s = (q.to(sdt).view(Ac, 1, self.H, self.da) * t.to(sdt).view(Ac, N, self.H, self.da)).sum(-1)
+                s = (q.to(sdt).view(Ac, 1, self.H, self.da) * t.view(Ac, N, self.H, self.da)).sum(-1)
                 s = (s / math.sqrt(self.da)).masked_fill(~km[..., None], NEG)
                 a = torch.softmax(s, 1) * km[..., None].to(sdt)
                 stats.append(_logit_stats(s, a, km) if self.diagnostics else t.new_zeros(Ac, 0))
-                w = a.to(t.dtype)[..., None].expand(Ac, N, self.H, self.da).reshape(Ac, N, D)
-            tb = bonded(t, [cfac[bd][b] for bd in self.uniq[u].bonds])
-            outs.append((w.view(*w.shape, *[1] * len(self.uniq[u].bonds)) * tb).sum(1))
+                w = a[..., None].expand(Ac, N, self.H, self.da).reshape(Ac, N, D)
+            tb = bonded(t, [cfac[bd][b].to(sdt) for bd in self.uniq[u].bonds])
+            outs.append((w.view(*w.shape, *[1] * len(self.uniq[u].bonds)) * tb).sum(1))   # [Ac,D,R..] fp32
         if self.diagnostics:                                                # masked std via sums: no host sync
             kmf = km[..., None].to(t.dtype); cnt = (kmf.sum() * D).clamp_min(1)
             mu = (t * kmf).sum() / cnt; tstd = (((t - mu) ** 2 * kmf).sum() / cnt).sqrt().detach()
@@ -99,7 +99,8 @@ class Motif(nn.Module):
 
     def contract(self, vals):                        # mix on D, elementwise product, contract bonds -> [A,d_mix]
         mixed = [torch.movedim(self.mix[k](torch.movedim(vals[self.slot[k]], 1, -1)), -1, 1) for k in range(len(self.spec))]
-        return torch.einsum(self.einsum, *mixed)
+        dt = functools.reduce(torch.promote_types, [m.dtype for m in mixed])
+        return torch.einsum(self.einsum, *[m.to(dt) for m in mixed])
 
     def forward(self, rbar, g, n, mask, cfac=None, anc=None, gate=None, cand_mask=None):
         """rbar is per anchor, [A,d_r], aligned with anc (a dense [B,N,N,d_r] is accepted and gathered once).

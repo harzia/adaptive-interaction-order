@@ -37,9 +37,13 @@ def bonded(t, cs):
     return t
 
 
-def term(S, g, n, b, i, j):                        # t^S over all k for a chunk of anchors: [Ac,N,D]
-    nk = n[b]
-    return {"ij": lambda: g[b, i] * g[b, j] * nk, "i": lambda: g[b, i] * nk, "j": lambda: g[b, j] * nk, "": lambda: nk}[S]()
+def term(S, g, n, b, i, j, dtype=None):
+    """t^S over all k for a chunk of anchors: [Ac,N,D].  The gathered rows (not the dense g, n) are cast to
+    `dtype` BEFORE the product, so under bf16/fp16 autocast the triple product is formed in fp32 (spec §2.3)."""
+    c = (lambda x: x) if dtype is None else (lambda x: x.to(dtype))
+    nk = c(n[b])
+    return {"ij": lambda: c(g[b, i]) * c(g[b, j]) * nk, "i": lambda: c(g[b, i]) * nk,
+            "j": lambda: c(g[b, j]) * nk, "": lambda: nk}[S]()
 
 
 def node_pool_at(p, g, n, mask, cmask, cfac, anc):

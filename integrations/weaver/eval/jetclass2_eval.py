@@ -286,6 +286,35 @@ SIGNAL_GROUPS = {'label_X_QQ': [0, 1, 2, 3, 4, 5, 6, 7, 8],
 
 WORKING_POINTS = (0.30, 0.50)
 
+# Search-relevant operating points: report the maximum signal efficiency
+# achievable while respecting a fixed QCD-efficiency budget.
+FIXED_BACKGROUND_EFFICIENCIES = (1e-2, 1e-3, 1e-4)
+
+# Freeze the hypothesis-driven fully-hadronic subset used for the primary
+# AIO/F3 topology summaries. These are the nine broad groups containing only
+# quarks/gluons (no charged leptons, neutrinos, or taus).
+HADRONIC_GROUP_NAMES = (
+    "label_X_QQ",
+    "label_X_gg",
+    "label_X_YY_QQQQ",
+    "label_X_YY_QQgg",
+    "label_X_YY_gggg",
+    "label_X_YY_QQQ",
+    "label_X_YY_QQg",
+    "label_X_YY_Qgg",
+    "label_X_YY_ggg",
+)
+HADRONIC_GROUP_SET = set(HADRONIC_GROUP_NAMES)
+
+if not HADRONIC_GROUP_SET.issubset(SIGNAL_GROUPS):
+    missing_hadronic_groups = sorted(
+        HADRONIC_GROUP_SET.difference(SIGNAL_GROUPS)
+    )
+    raise RuntimeError(
+        "Hadronic JetClass-II groups are missing from SIGNAL_GROUPS: "
+        + ", ".join(missing_hadronic_groups)
+    )
+
 # The full JetClass-II test set is very large, so evaluation is streamed.
 #
 # Group-vs-QCD ROC quantities are accumulated with fine score histograms.
@@ -555,7 +584,9 @@ def evaluate_prediction_files(
       true labels 161-187;
     * stratified-sample 188-way macro one-vs-one ROC AUC;
     * signal-topology-vs-QCD AUC for the 29 JetClass-II topology groups;
-    * QCD background rejection at 30% and 50% signal efficiency for those groups.
+    * QCD background rejection at 30% and 50% signal efficiency for those groups;
+    * signal efficiency at fixed QCD efficiencies 1e-2, 1e-3, and 1e-4,
+      with primary macro summaries over the frozen nine-group hadronic subset.
 
     For a signal topology S, the binary discriminant is
 
@@ -784,11 +815,13 @@ def evaluate_prediction_files(
         "accuracy_2prong": accuracy_2prong,
         "accuracy_3prong": accuracy_3prong,
         "accuracy_4prong": accuracy_4prong,
+        "accuracy_34prong": accuracy_34prong,
         "accuracy_qcd": accuracy_qcd,
         "num_events": int(num_events),
         "num_2prong_events": int(class_counts[two_prong_indices].sum()),
         "num_3prong_events": int(class_counts[THREE_PRONG_INDICES].sum()),
         "num_4prong_events": int(class_counts[FOUR_PRONG_INDICES].sum()),
+        "num_34prong_events": int(class_counts[combined_34_indices].sum()),
         "num_qcd_events": int(class_counts[qcd_indices].sum()),
     }
 
@@ -816,6 +849,7 @@ def evaluate_prediction_files(
     rej30_rows: list[list[Any]] = []
     rej50_rows: list[list[Any]] = []
     auc_group_rows: list[list[Any]] = []
+    fixed_background_rows: list[list[Any]] = []
 
     plot_rejections_by_wp: dict[float, tuple[list[str], list[float]]] = {
         working_point: ([], [])
@@ -825,7 +859,13 @@ def evaluate_prediction_files(
     plot_aucs: list[float] = []
 
     group_auc_values: list[float] = []
+    hadronic_group_auc_values: list[float] = []
+
     geomean_values_by_wp: dict[float, list[float]] = {
+        working_point: []
+        for working_point in WORKING_POINTS
+    }
+    hadronic_geomean_values_by_wp: dict[float, list[float]] = {
         working_point: []
         for working_point in WORKING_POINTS
     }
@@ -833,9 +873,23 @@ def evaluate_prediction_files(
         working_point: 0
         for working_point in WORKING_POINTS
     }
+    hadronic_censored_groups_by_wp: dict[float, int] = {
+        working_point: 0
+        for working_point in WORKING_POINTS
+    }
+
+    signal_eff_values_by_epsb: dict[float, list[float]] = {
+        target_background_efficiency: []
+        for target_background_efficiency in FIXED_BACKGROUND_EFFICIENCIES
+    }
+    hadronic_signal_eff_values_by_epsb: dict[float, list[float]] = {
+        target_background_efficiency: []
+        for target_background_efficiency in FIXED_BACKGROUND_EFFICIENCIES
+    }
 
     for group_index, group_name in enumerate(GROUP_NAMES):
         display_name = _display_name(group_name)
+        is_hadronic = group_name in HADRONIC_GROUP_SET
         num_signal_group = int(signal_hist[group_index].sum())
         num_qcd_group = int(qcd_hist[group_index].sum())
         group_auc: float | None = None
@@ -878,6 +932,17 @@ def evaluate_prediction_files(
             geomean_values_by_wp[working_point].append(
                 geomean_value
             )
+            if is_hadronic:
+                hadronic_geomean_values_by_wp[working_point].append(
+                    geomean_value
+                )
+                if (
+                    background_rejection is None
+                    and num_signal_group > 0
+                    and num_qcd_group > 0
+                    and selected_background_efficiency == 0.0
+                ):
+                    hadronic_censored_groups_by_wp[working_point] += 1
 
             row = [
                 display_name,
@@ -904,6 +969,48 @@ def evaluate_prediction_files(
                 plot_groups_for_wp.append(display_name)
                 plot_values_for_wp.append(float(background_rejection))
 
+        for target_background_efficiency in FIXED_BACKGROUND_EFFICIENCIES:
+            (
+                selected_signal_efficiency,
+                selected_background_efficiency,
+                threshold,
+                num_background_survivors,
+            ) = _signal_efficiency_at_background_efficiency(
+                signal_hist[group_index],
+                qcd_hist[group_index],
+                target_background_efficiency,
+            )
+
+            epsb_suffix = _background_efficiency_suffix(
+                target_background_efficiency
+            )
+            metrics[
+                f"sig_eff_at_epsb{epsb_suffix}_per_group/{display_name}"
+            ] = selected_signal_efficiency
+
+            fixed_background_rows.append(
+                [
+                    display_name,
+                    bool(is_hadronic),
+                    num_signal_group,
+                    num_qcd_group,
+                    float(target_background_efficiency),
+                    selected_background_efficiency,
+                    selected_signal_efficiency,
+                    num_background_survivors,
+                    threshold,
+                ]
+            )
+
+            if selected_signal_efficiency is not None:
+                signal_eff_values_by_epsb[
+                    target_background_efficiency
+                ].append(float(selected_signal_efficiency))
+                if is_hadronic:
+                    hadronic_signal_eff_values_by_epsb[
+                        target_background_efficiency
+                    ].append(float(selected_signal_efficiency))
+
         metrics[f"auc_group_vs_qcd/{display_name}"] = group_auc
         auc_group_rows.append(
             [
@@ -916,6 +1023,8 @@ def evaluate_prediction_files(
 
         if group_auc is not None:
             group_auc_values.append(float(group_auc))
+            if is_hadronic:
+                hadronic_group_auc_values.append(float(group_auc))
             plot_auc_groups.append(display_name)
             plot_aucs.append(float(group_auc))
 
@@ -924,6 +1033,34 @@ def evaluate_prediction_files(
         if len(group_auc_values) == NUM_SIGNAL_GROUPS
         else None
     )
+    metrics["auc_group_vs_qcd_macro_hadronic"] = (
+        float(np.mean(hadronic_group_auc_values))
+        if len(hadronic_group_auc_values) == len(HADRONIC_GROUP_NAMES)
+        else None
+    )
+
+    for target_background_efficiency in FIXED_BACKGROUND_EFFICIENCIES:
+        epsb_suffix = _background_efficiency_suffix(
+            target_background_efficiency
+        )
+
+        all_values = signal_eff_values_by_epsb[
+            target_background_efficiency
+        ]
+        metrics[f"sig_eff_at_epsb{epsb_suffix}_macro"] = (
+            float(np.mean(all_values))
+            if len(all_values) == NUM_SIGNAL_GROUPS
+            else None
+        )
+
+        hadronic_values = hadronic_signal_eff_values_by_epsb[
+            target_background_efficiency
+        ]
+        metrics[f"sig_eff_at_epsb{epsb_suffix}_macro_hadronic"] = (
+            float(np.mean(hadronic_values))
+            if len(hadronic_values) == len(HADRONIC_GROUP_NAMES)
+            else None
+        )
 
     for working_point in WORKING_POINTS:
         percentage = int(round(100 * working_point))
@@ -946,6 +1083,25 @@ def evaluate_prediction_files(
             f"rej{percentage}_geomean_num_censored_groups"
         ] = int(censored_groups_by_wp[working_point])
 
+        hadronic_values = np.asarray(
+            hadronic_geomean_values_by_wp[working_point],
+            dtype=np.float64,
+        )
+        if (
+            hadronic_values.size == len(HADRONIC_GROUP_NAMES)
+            and np.all(np.isfinite(hadronic_values))
+            and np.all(hadronic_values > 0)
+        ):
+            metrics[f"rej{percentage}_geomean_hadronic"] = float(
+                np.exp(np.mean(np.log(hadronic_values)))
+            )
+        else:
+            metrics[f"rej{percentage}_geomean_hadronic"] = None
+
+        metrics[
+            f"rej{percentage}_geomean_hadronic_num_censored_groups"
+        ] = int(hadronic_censored_groups_by_wp[working_point])
+
     pair_rows: list[list[Any]] = []
     for pair_index, pair_name in enumerate(PAIR_NAMES):
         (
@@ -961,6 +1117,7 @@ def evaluate_prediction_files(
         )
 
         metrics[f"rej50_pairs/{pair_name}"] = pair_rejection
+        metrics[f"auc_pairs/{pair_name}"] = pair_auc
 
         definition = PAIR_DEFINITIONS[pair_name]
         pair_rows.append(
@@ -1099,6 +1256,20 @@ def evaluate_prediction_files(
                 ],
                 "data": auc_group_rows,
             },
+            "signal_eff_at_fixed_background_efficiency": {
+                "columns": [
+                    "signal_group",
+                    "is_hadronic",
+                    "num_signal_events",
+                    "num_qcd_events",
+                    "target_background_efficiency",
+                    "selected_background_efficiency",
+                    "selected_signal_efficiency",
+                    "num_background_survivors",
+                    "threshold",
+                ],
+                "data": fixed_background_rows,
+            },
             "rej50_pairs": {
                 "columns": [
                     "pair",
@@ -1202,6 +1373,27 @@ def evaluate_prediction_files(
             },
             "num_signal_groups": NUM_SIGNAL_GROUPS,
             "signal_working_points": list(WORKING_POINTS),
+            "fixed_background_efficiency_working_points": list(
+                FIXED_BACKGROUND_EFFICIENCIES
+            ),
+            "signal_efficiency_working_point_definition": (
+                "Strictest represented histogram threshold with measured signal "
+                "efficiency >= the requested target. This maximizes background "
+                "rejection without undershooting the target signal efficiency; "
+                "realized efficiencies and thresholds are reported in the tables."
+            ),
+            "fixed_background_efficiency_definition": (
+                "Maximum signal efficiency at the loosest histogram threshold "
+                "satisfying selected QCD efficiency <= the requested target."
+            ),
+            "hadronic_signal_groups": [
+                _display_name(group_name)
+                for group_name in HADRONIC_GROUP_NAMES
+            ],
+            "hadronic_macro_definition": (
+                "Unweighted arithmetic mean over the frozen nine fully-hadronic "
+                "signal topology groups."
+            ),
             "background_rejection_definition": (
                 "1 / QCD efficiency at each selected signal working point"
             ),
@@ -1224,6 +1416,10 @@ def evaluate_prediction_files(
             "pair_benchmarks": {
                 "score": "p(S1) / (p(S1) + p(S2))",
                 "working_point": 0.50,
+                "working_point_definition": (
+                    "Strictest represented histogram threshold with measured "
+                    "signal efficiency >= 0.50."
+                ),
                 "definitions": {
                     pair_name: {
                         "role": PAIR_DEFINITIONS[pair_name]["role"],
@@ -1247,6 +1443,10 @@ def evaluate_prediction_files(
             },
         },
         "metrics": metrics,
+        # Persist the detailed tables as well as returning them to Weaver.  These
+        # contain realized efficiencies, thresholds, survivor counts, per-class
+        # recalls, and pair AUCs needed to audit each reported working point.
+        "tables": result["tables"],
     }
 
     metrics_path = results_dir / "metrics.json"
@@ -1382,11 +1582,34 @@ def _metrics_from_histograms(
     float | None,
     float | None,
 ]:
+    """Return rejection and AUC at a fixed minimum signal efficiency.
+
+    Working-point convention
+    ------------------------
+    Among represented histogram thresholds, choose the *strictest* threshold
+    whose measured signal efficiency is still >= ``target_efficiency``.
+
+    This convention is deliberately one-sided: it never undershoots the target
+    signal efficiency.  On a plateau of identical signal efficiency it chooses
+    the highest threshold, avoiding extra background acceptance that buys no
+    additional signal efficiency.
+
+    If the requested efficiency is not exactly attainable with the discrete
+    histogram, the returned ``selected_signal_efficiency`` is the smallest
+    represented efficiency that remains >= the target.  The achieved signal
+    and background efficiencies and the selected threshold are returned so the
+    histogram approximation is explicit and auditable.
+    """
     num_signal = int(signal_hist.sum())
     num_background = int(background_hist.sum())
 
     if num_signal == 0 or num_background == 0:
         return None, None, None, None, None
+
+    if not (0.0 < target_efficiency <= 1.0):
+        raise ValueError(
+            "target_efficiency must lie in (0, 1]."
+        )
 
     # Counts passing a threshold at the lower edge of each score bin.
     signal_tail = np.cumsum(
@@ -1407,12 +1630,21 @@ def _metrics_from_histograms(
         / num_background
     )
 
-    working_point_index = int(
-        np.abs(
-            signal_efficiency
-            - target_efficiency
-        ).argmin()
+    # Tails are non-increasing as the threshold index increases.  The last
+    # index satisfying eps_S >= target is therefore the strictest represented
+    # cut that does not undershoot the requested signal efficiency.  Choosing
+    # the last index also resolves signal-efficiency plateaus in favor of the
+    # best background rejection.
+    valid_indices = np.flatnonzero(
+        signal_efficiency >= target_efficiency
     )
+
+    # For target_efficiency in (0, 1] and non-empty signal_hist this should
+    # always contain bin 0 (eps_S == 1). Keep the guard for defensive clarity.
+    if valid_indices.size == 0:
+        return None, None, None, None, None
+
+    working_point_index = int(valid_indices[-1])
 
     selected_signal_efficiency = float(
         signal_efficiency[working_point_index]
@@ -1421,7 +1653,7 @@ def _metrics_from_histograms(
         background_efficiency[working_point_index]
     )
 
-    threshold = (
+    threshold = float(
         working_point_index
         / ROC_BINS
     )
@@ -1433,7 +1665,8 @@ def _metrics_from_histograms(
     )
 
     # Histogram approximation to AUC = P(score_signal > score_background),
-    # with half credit for ties within the same score bin.
+    # with half credit for ties within the same score bin.  This calculation is
+    # independent of the working-point selection above.
     background_below = (
         np.cumsum(background_hist, dtype=np.int64)
         - background_hist
@@ -1456,10 +1689,102 @@ def _metrics_from_histograms(
         selected_signal_efficiency,
         selected_background_efficiency,
         background_rejection,
-        float(threshold),
+        threshold,
         auc,
     )
 
+
+
+def _signal_efficiency_at_background_efficiency(
+    signal_hist: np.ndarray,
+    background_hist: np.ndarray,
+    target_background_efficiency: float,
+) -> tuple[
+    float | None,
+    float | None,
+    float | None,
+    int | None,
+]:
+    """
+    Return the best signal efficiency satisfying a background-efficiency cap.
+
+    The histogram threshold is chosen conservatively: among represented score
+    thresholds, select the loosest threshold whose measured background
+    efficiency is <= ``target_background_efficiency``. This maximizes signal
+    efficiency subject to the requested QCD-efficiency budget.
+
+    If the target cannot be resolved with the current histogram binning, all
+    returned values are ``None`` rather than silently violating the budget.
+    """
+    num_signal = int(signal_hist.sum())
+    num_background = int(background_hist.sum())
+
+    if num_signal == 0 or num_background == 0:
+        return None, None, None, None
+
+    if not (0.0 < target_background_efficiency <= 1.0):
+        raise ValueError(
+            "target_background_efficiency must lie in (0, 1]."
+        )
+
+    signal_tail = np.cumsum(
+        signal_hist[::-1],
+        dtype=np.int64,
+    )[::-1]
+    background_tail = np.cumsum(
+        background_hist[::-1],
+        dtype=np.int64,
+    )[::-1]
+
+    # Work in integer survivor counts to avoid ambiguity around ratios such as
+    # 359 / 3_598_920 at a nominal 1e-4 target.
+    max_background_survivors = int(
+        np.floor(
+            target_background_efficiency * num_background
+            + 1e-12
+        )
+    )
+
+    valid_indices = np.flatnonzero(
+        background_tail <= max_background_survivors
+    )
+
+    if valid_indices.size == 0:
+        return None, None, None, None
+
+    # Tails decrease as the threshold increases, so the first valid bin is the
+    # loosest threshold satisfying the background-efficiency budget.
+    working_point_index = int(valid_indices[0])
+
+    num_background_survivors = int(
+        background_tail[working_point_index]
+    )
+    selected_background_efficiency = float(
+        num_background_survivors / num_background
+    )
+    selected_signal_efficiency = float(
+        signal_tail[working_point_index] / num_signal
+    )
+    threshold = float(
+        working_point_index / ROC_BINS
+    )
+
+    return (
+        selected_signal_efficiency,
+        selected_background_efficiency,
+        threshold,
+        num_background_survivors,
+    )
+
+
+def _background_efficiency_suffix(
+    background_efficiency: float,
+) -> str:
+    """Compact stable metric suffix, e.g. 1e-2 -> '1e-2'."""
+    return f"{background_efficiency:.0e}".replace("e-0", "e-").replace(
+        "e+0",
+        "e+",
+    )
 
 def _display_name(name: str) -> str:
     return (

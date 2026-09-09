@@ -47,36 +47,74 @@ class HigherOrderBlock(nn.Module):
         delta_a, anc_out, aux = self.motif(rbar, g, n, mask, cfac, anc_all, gate, cand_mask)
         aux["rbar"] = rbar
         return delta_a, anc_out, aux
-
+    
     @torch.no_grad()
     def calibrate(self, h, e_pair, mask, target=1.0, force=False):
-        """Real-batch init (§2.4): unit-variance factors per channel, then each head of each W_q so that
-        head's within-anchor logit std ≈ target.  Use post-trimmer inputs and the block-4 states, in fp32,
-        once after loading the baseline.  Sets `calibrated`; a resumed checkpoint is not recalibrated."""
-        if bool(self.calibrated) and not force:
+        """
+        One-time real-batch initialization calibration.
+        1. Rescale MLP_g output channels to unit std on valid off-diagonal legs.
+        2. Rescale MLP_n output channels to unit std on valid nodes.
+        3. Recompute the F3 logits.
+        4. Rescale each W_q head so mean within-anchor logit std ~= target.
+        `calibrated` is persistent in the state dict, so resumed checkpoints
+        automatically skip this.
+        """
+        if bool(self.calibrated.item()) and not force:
             return {"skipped": True}
-        diag, self.motif.diagnostics = self.motif.diagnostics, True
-        _, g, n, _ = self.factors(h, e_pair)
-        pm = mask[:, :, None] & mask[:, None, :]
-        sg, sn = g[pm].std(0).clamp_min(1e-6), n[mask].std(0).clamp_min(1e-6)
-        for lin, sd in ((self.factors.g[-1], sg), (self.factors.n[-1], sn)):
-            lin.weight.div_(sd[:, None]); lin.bias.div_(sd)
-        rep = {"g_std_before": sg.mean(), "n_std_before": sn.mean()}
-        _, _, aux = self.forward(h, e_pair, mask)
-        H = self.motif.H
-        for u, ls in aux["stats"]["logit_std"].items():                     # ls: [A,H]
-            per_head = ls.mean(0).clamp_min(1e-6)                            # one scale per head
-            self.motif.Wq[str(u)].weight.view(H, -1, self.motif.Wq[str(u)].weight.shape[1]).mul_((target / per_head)[:, None, None])
-            rep[f"logit_std_before_pool{u}_per_head"] = per_head
-        _, _, aux = self.forward(h, e_pair, mask)
-        for u in aux["stats"]["logit_std"]:
-            rep[f"logit_std_after_pool{u}_per_head"] = aux["stats"]["logit_std"][u].mean(0)
-            rep[f"entropy_after_pool{u}_per_head"] = aux["stats"]["entropy"][u].mean(0)
-        rep["term_std_after"] = aux["stats"]["term_std"]
-        self.motif.diagnostics = diag
-        self.calibrated.fill_(True)
-        return rep
+        old_diagnostics = self.motif.diagnostics
+        self.motif.diagnostics = True
+        try:
+            _, g, n, _ = self.factors(h, e_pair)
+            B, N = mask.shape
+            eye = torch.eye(N, dtype=torch.bool, device=mask.device)
+            leg_mask = mask[:, :, None] & mask[:, None, :] & ~eye[None]
+            if not bool(leg_mask.any().item()):
+                raise RuntimeError("F3 calibration batch contains no valid pair legs.")
+            if not bool(mask.any().item()):
+                raise RuntimeError("F3 calibration batch contains no valid nodes.")
+            g_std = g[leg_mask].float().std(dim=0, unbiased=False).clamp_min(1e-6)
+            n_std = n[mask].float().std(dim=0, unbiased=False).clamp_min(1e-6)
 
+            report = {"g_std_before": g_std.mean(), "n_std_before": n_std.mean(),}
+            for linear, std in (
+                (self.factors.g[-1], g_std),
+                (self.factors.n[-1], n_std),
+            ):
+                linear.weight.div_(std[:, None].to(linear.weight.dtype))
+                if linear.bias is not None:
+                    linear.bias.div_(std.to(linear.bias.dtype))
+
+            _, _, aux = self.forward(h, e_pair, mask)
+            H = self.motif.H
+            for pool_id, logit_std in aux["stats"]["logit_std"].items():
+                per_head = logit_std.float().mean(dim=0).clamp_min(1e-6)
+                Wq = self.motif.Wq[str(pool_id)]
+                Wq_view = Wq.weight.view(H, -1, Wq.weight.shape[1])
+                scale = (target / per_head).to(Wq.weight.dtype)
+                Wq_view.mul_(scale[:, None, None])
+                report[f"logit_std_before_pool{pool_id}_per_head"] = per_head
+
+            _, g_after, n_after, _ = self.factors(h, e_pair)
+            report["g_std_after"] = (
+                g_after[leg_mask].float().std(dim=0, unbiased=False).mean()
+            )
+            report["n_std_after"] = (
+                n_after[mask].float().std(dim=0, unbiased=False).mean()
+            )
+            _, _, aux = self.forward(h, e_pair, mask)
+            for pool_id in aux["stats"]["logit_std"]:
+                report[f"logit_std_after_pool{pool_id}_per_head"] = (
+                    aux["stats"]["logit_std"][pool_id].float().mean(dim=0)
+                )
+                report[f"entropy_after_pool{pool_id}_per_head"] = (
+                    aux["stats"]["entropy"][pool_id].float().mean(dim=0)
+                )
+            report["term_std_after"] = aux["stats"]["term_std"].float()
+            self.calibrated.fill_(True)
+            return report
+
+        finally:
+            self.motif.diagnostics = old_diagnostics
 
 class Injection(nn.Module):
     def __init__(self, d_r, n_heads, d_model):

@@ -108,23 +108,29 @@ class AIOParticleTransformer(ParticleTransformer):
     `_forward_encoder` + `_forward_aggregator` both go through the stage.  Runtime knobs are attributes
     (set them on the module; the Weaver wrapper's forward signature is unchanged):
         use_f3 (True)   rho (None = dense)   anc / gate / cand_mask (None)   — see spec §2.6, §3.1, §5.
+        record_last (False): keep branch outputs in `self.last` (use under no_grad; see __init__).
+        require_calibration (True): first training forward raises if the stage was never calibrated.
     `spec` may be a tuple of PoolSpec or one of the names in SPECS (Weaver -o options are strings)."""
 
     def __init__(self, *a, f3_after=4, spec="triangle", D=32, H3=2, d_r=32, anchor_chunk=256, dense_matmul=False,
                  use_router=False, diagnostics=False, **kw):
         super().__init__(*a, **kw)
+        assert not self.include_global_token, "AIO adapter: include_global_token is not supported"
+        assert all(self.block_ids_with_attn_mask), "AIO adapter passes the pair bias to every particle block"
         spec = SPECS[spec] if isinstance(spec, str) else spec
-        tap = PairEmbedTap.convert(self.pair_embed, d_b=16)
-        for blk in self.blocks:
-            blk.__class__, blk.attn.__class__ = AIOBlock, AIOAttention
         d, H = self.blocks[0].embed_dim, self.blocks[0].num_heads
         self.f3_after = f3_after
-        self.hob = HigherOrderBlock(d, tap.pair_dim, spec=spec, D=D, H=H3, d_r=d_r, d_b=tap.pair_dim,
-                                    anchor_chunk=anchor_chunk, dense_matmul=dense_matmul, use_router=use_router,
-                                    diagnostics=diagnostics)
-        self.inj = Injection(d_r, H, d)
+        with torch.random.fork_rng(devices=[]):
+            tap = PairEmbedTap.convert(self.pair_embed, d_b=16)
+            self.hob = HigherOrderBlock(d, tap.pair_dim, spec=spec, D=D, H=H3, d_r=d_r, d_b=tap.pair_dim,
+                                        anchor_chunk=anchor_chunk, dense_matmul=dense_matmul, use_router=use_router,
+                                        diagnostics=diagnostics)
+            self.inj = Injection(d_r, H, d)
+        for blk in self.blocks:
+            blk.__class__, blk.attn.__class__ = AIOBlock, AIOAttention
         self.use_f3, self.rho, self.anc, self.gate, self.cand_mask = True, None, None, None, None
-        self.last = None
+        self.record_last, self.last = False, None
+        self.require_calibration, self._calibration_checked = True, False
 
     def load_baseline(self, state_dict):
         """Warm start from a completed baseline checkpoint (§4.4 continued-training control only — not needed
@@ -146,6 +152,11 @@ class AIOParticleTransformer(ParticleTransformer):
 
     def _forward_encoder(self, x, v=None, mask=None, uu=None, uu_idx=None):
         """Mirror of upstream _forward_encoder; the lines marked AIO are the additions."""
+        if self.training and self.use_f3 and self.require_calibration and not self._calibration_checked:
+            if not bool(self.hob.calibrated.item()):                          # one host sync, first training step only
+                raise RuntimeError("F3 stage is uncalibrated in a training forward: run calibrate() before the first "
+                                   "optimizer step (spec §2.2), or set model.require_calibration=False on purpose.")
+            self._calibration_checked = True
         x, padding_mask, e_pair, attn_mask = self._prelude(x, v, mask, uu, uu_idx)
         msg_fn, self.last = None, None
         for li, block in enumerate(self.blocks):
@@ -153,7 +164,8 @@ class AIOParticleTransformer(ParticleTransformer):
             if self.use_f3 and li + 1 == self.f3_after:                       # AIO: Δr from this block's output
                 B, N = padding_mask.shape
                 delta_a, anc_sel, aux = self.hob(x, e_pair, ~padding_mask, self.rho, self.anc, self.gate, self.cand_mask)
-                self.last = {"delta_a": delta_a, "anc": anc_sel, **aux}
+                if self.record_last:                                          # Fix 3: opt-in, see __init__
+                    self.last = {"delta_a": delta_a, "anc": anc_sel, **aux}
                 if anc_sel.shape[0]:                                          # zero-selection: host untouched
                     attn_mask = attn_mask + self.inj.bias(delta_a, anc_sel, B, N)
                     msg_fn = lambda a, d=delta_a, s=anc_sel: self.inj.message(a, d, s)
@@ -161,17 +173,37 @@ class AIOParticleTransformer(ParticleTransformer):
 
     @torch.no_grad()
     def calibrate(self, x, v=None, mask=None, uu=None, uu_idx=None, target=1.0, force=False):
-        """Run once at init (per seed), on a real batch, in fp32: block-4 states and post-trimmer pair features go
-        to HigherOrderBlock.calibrate.  Sets hob.calibrated (saved in the state dict; a second call is a no-op)."""
-        was_training = self.training; self.eval()
-        with torch.autocast(device_type=x.device.type, enabled=False):        # fp32 regardless of the caller
-            x, padding_mask, e_pair, attn_mask = self._prelude(x.float(), None if v is None else v.float(), mask, uu, uu_idx)
-            for li, block in enumerate(self.blocks):
-                x = block(x, padding_mask=padding_mask, attn_mask=attn_mask)
-                if li + 1 == self.f3_after: break
-            rep = self.hob.calibrate(x.float(), e_pair.float(), ~padding_mask, target=target, force=force)
-        self.train(was_training)
-        return rep
+        """Run F3 calibration once on a real Weaver training batch, in fp32 (spec §2.2)"""
+        if bool(self.hob.calibrated.item()) and not force:
+            return {"skipped": True}
+        was_training = self.training
+        trimmer_counter = self.trimmer._counter.detach().clone() if hasattr(self.trimmer, "_counter") else None
+        bns = [m for m in self.modules() if isinstance(m, torch.nn.modules.batchnorm._BatchNorm)]
+        bn_state = [{k: b.detach().clone() for k, b in m.named_buffers(recurse=False)} for m in bns]
+        self.eval()
+        for m in bns:
+            m.train()
+        try:
+            uu_in = uu.float() if uu is not None and torch.is_floating_point(uu) else uu
+            with torch.autocast(device_type=x.device.type, enabled=False):
+                h, padding_mask, e_pair, attn_mask = self._prelude(
+                    x.float(), None if v is None else v.float(), mask, uu_in, uu_idx
+                )
+                for li, block in enumerate(self.blocks):
+                    h = block(h, padding_mask=padding_mask, attn_mask=attn_mask)
+                    if li + 1 == self.f3_after: break
+                report = self.hob.calibrate(
+                    h.float(), e_pair.float(), ~padding_mask, target=target, force=force
+                )
+            report["bn_batch_stats"] = len(bns)
+            return report
+        finally:
+            for m, st in zip(bns, bn_state):
+                for k, b in m.named_buffers(recurse=False):
+                    b.copy_(st[k])
+            if trimmer_counter is not None:
+                self.trimmer._counter.copy_(trimmer_counter)
+            self.train(was_training)
 
 
 @torch.no_grad()
