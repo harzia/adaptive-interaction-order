@@ -57,8 +57,33 @@ class HigherOrderBlock(nn.Module):
             return {"skipped": True}
         diag, self.motif.diagnostics = self.motif.diagnostics, True
         _, g, n, _ = self.factors(h, e_pair)
-        pm = mask[:, :, None] & mask[:, None, :]
-        sg, sn = g[pm].std(0).clamp_min(1e-6), n[mask].std(0).clamp_min(1e-6)
+        B, N = mask.shape
+
+        eye = torch.eye(
+            N,
+            dtype=torch.bool,
+            device=mask.device,
+        )
+
+        leg_mask = (
+            mask[:, :, None]
+            & mask[:, None, :]
+            & ~eye[None]
+        )
+
+        sg = (
+            g[leg_mask]
+            .float()
+            .std(0, unbiased=False)
+            .clamp_min(1e-6)
+        )
+
+        sn = (
+            n[mask]
+            .float()
+            .std(0, unbiased=False)
+            .clamp_min(1e-6)
+        )
         for lin, sd in ((self.factors.g[-1], sg), (self.factors.n[-1], sn)):
             lin.weight.div_(sd[:, None]); lin.bias.div_(sd)
         rep = {"g_std_before": sg.mean(), "n_std_before": sn.mean()}
@@ -76,6 +101,189 @@ class HigherOrderBlock(nn.Module):
         self.motif.diagnostics = diag
         self.calibrated.fill_(True)
         return rep
+
+    @torch.no_grad()
+    def calibration_diagnostics(
+        self,
+        h,
+        e_pair,
+        mask,
+    ):
+        """
+        Measure F3 initialization statistics without modifying
+        parameters, buffers, or the calibrated flag.
+
+        Args:
+            h:
+                [B, N, d] block-f3_after particle states.
+            e_pair:
+                [B, N, N, d_e] pair representation supplied
+                by the host adapter.
+            mask:
+                [B, N] bool, True for valid particles.
+
+        Returns:
+            Dictionary of scalar/per-head diagnostics.
+        """
+        old_diagnostics = self.motif.diagnostics
+        self.motif.diagnostics = True
+
+        try:
+            e_hat, g, n, cfac = self.factors(
+                h,
+                e_pair,
+            )
+
+            anc = anchors(mask)
+
+            if anc.shape[0] == 0:
+                raise RuntimeError(
+                    "Calibration diagnostic received a batch "
+                    "with zero valid anchors."
+                )
+
+            rbar = (
+                self.factors.rbar_at(
+                    e_hat,
+                    h,
+                    anc,
+                )
+                if self.needs_rbar
+                else None
+            )
+
+            # F3 never uses g_ii because k != i,j.
+            # Measure only valid off-diagonal leg factors.
+            B, N = mask.shape
+
+            eye = torch.eye(
+                N,
+                dtype=torch.bool,
+                device=mask.device,
+            )
+
+            leg_mask = (
+                mask[:, :, None]
+                & mask[:, None, :]
+                & ~eye[None]
+            )
+
+            g_valid = g[leg_mask].float()
+            n_valid = n[mask].float()
+
+            g_std = g_valid.std(
+                dim=0,
+                unbiased=False,
+            )
+
+            n_std = n_valid.std(
+                dim=0,
+                unbiased=False,
+            )
+
+            # Run the actual F3 pool with diagnostics enabled.
+            # U3 is irrelevant here; we only inspect pool statistics.
+            _, _, aux = self.motif(
+                rbar,
+                g,
+                n,
+                mask,
+                cfac,
+                anc,
+            )
+
+            stats = aux["stats"]
+
+            report = {
+                "num_valid_nodes": int(
+                    mask.sum().item()
+                ),
+                "num_valid_legs": int(
+                    leg_mask.sum().item()
+                ),
+                "num_anchors": int(
+                    anc.shape[0]
+                ),
+
+                "g_std_mean": g_std.mean(),
+                "g_std_min": g_std.min(),
+                "g_std_max": g_std.max(),
+                "g_std_per_channel": g_std,
+
+                "n_std_mean": n_std.mean(),
+                "n_std_min": n_std.min(),
+                "n_std_max": n_std.max(),
+                "n_std_per_channel": n_std,
+
+                "term_std": stats[
+                    "term_std"
+                ].float(),
+            }
+
+            for u, values in (
+                stats["logit_std"].items()
+            ):
+                values = values.float()
+
+                report[
+                    f"logit_std_mean_pool{u}"
+                ] = values.mean(dim=0)
+
+                report[
+                    f"logit_std_median_pool{u}"
+                ] = values.median(dim=0).values
+
+                report[
+                    f"logit_std_p10_pool{u}"
+                ] = torch.quantile(
+                    values,
+                    0.10,
+                    dim=0,
+                )
+
+                report[
+                    f"logit_std_p90_pool{u}"
+                ] = torch.quantile(
+                    values,
+                    0.90,
+                    dim=0,
+                )
+
+            for u, values in (
+                stats["entropy"].items()
+            ):
+                values = values.float()
+
+                report[
+                    f"entropy_mean_pool{u}"
+                ] = values.mean(dim=0)
+
+                report[
+                    f"entropy_median_pool{u}"
+                ] = values.median(dim=0).values
+
+                report[
+                    f"entropy_p10_pool{u}"
+                ] = torch.quantile(
+                    values,
+                    0.10,
+                    dim=0,
+                )
+
+                report[
+                    f"entropy_p90_pool{u}"
+                ] = torch.quantile(
+                    values,
+                    0.90,
+                    dim=0,
+                )
+
+            return report
+
+        finally:
+            self.motif.diagnostics = (
+                old_diagnostics
+            )
 
 
 class Injection(nn.Module):

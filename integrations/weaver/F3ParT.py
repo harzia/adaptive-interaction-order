@@ -36,6 +36,28 @@ class AIOParticleTransformerWrapper(torch.nn.Module):
     def no_weight_decay(self):
         return {"mod.cls_token"}
 
+    @torch.no_grad()
+    def calibration_diagnostics(
+        self,
+        points,
+        features,
+        lorentz_vectors,
+        mask,
+    ):
+        """
+        Weaver-facing diagnostic interface.
+
+        Inputs are exactly the tensors produced by Weaver's
+        data_config/preprocessing pipeline.
+        """
+        del points
+
+        return self.mod.calibration_diagnostics(
+            features,
+            v=lorentz_vectors,
+            mask=mask,
+        )
+
     def forward(self, points, features, lorentz_vectors, mask):
         del points
 

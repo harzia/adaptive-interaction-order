@@ -160,18 +160,208 @@ class AIOParticleTransformer(ParticleTransformer):
         return x, padding_mask
 
     @torch.no_grad()
-    def calibrate(self, x, v=None, mask=None, uu=None, uu_idx=None, target=1.0, force=False):
-        """Run once at init (per seed), on a real batch, in fp32: block-4 states and post-trimmer pair features go
-        to HigherOrderBlock.calibrate.  Sets hob.calibrated (saved in the state dict; a second call is a no-op)."""
-        was_training = self.training; self.eval()
-        with torch.autocast(device_type=x.device.type, enabled=False):        # fp32 regardless of the caller
-            x, padding_mask, e_pair, attn_mask = self._prelude(x.float(), None if v is None else v.float(), mask, uu, uu_idx)
-            for li, block in enumerate(self.blocks):
-                x = block(x, padding_mask=padding_mask, attn_mask=attn_mask)
-                if li + 1 == self.f3_after: break
-            rep = self.hob.calibrate(x.float(), e_pair.float(), ~padding_mask, target=target, force=force)
-        self.train(was_training)
-        return rep
+    def calibrate(
+        self,
+        x,
+        v=None,
+        mask=None,
+        uu=None,
+        uu_idx=None,
+        target=1.0,
+        force=False,
+    ):
+        """
+        One-time real-batch F3 calibration.
+
+        Deliberately changes F3 factor/query weights, but does
+        NOT consume SequenceTrimmer warmup state.
+        """
+        was_training = self.training
+
+        trimmer_counter = None
+
+        if hasattr(
+            self.trimmer,
+            "_counter",
+        ):
+            trimmer_counter = (
+                self.trimmer._counter.detach()
+                .clone()
+            )
+
+        self.eval()
+
+        try:
+            with torch.autocast(
+                device_type=x.device.type,
+                enabled=False,
+            ):
+                x_in = x.float()
+
+                v_in = (
+                    None
+                    if v is None
+                    else v.float()
+                )
+
+                uu_in = uu
+                if (
+                    uu is not None
+                    and torch.is_floating_point(uu)
+                ):
+                    uu_in = uu.float()
+
+                (
+                    h,
+                    padding_mask,
+                    e_pair,
+                    attn_mask,
+                ) = self._prelude(
+                    x_in,
+                    v_in,
+                    mask,
+                    uu_in,
+                    uu_idx,
+                )
+
+                for li, block in enumerate(
+                    self.blocks
+                ):
+                    h = block(
+                        h,
+                        padding_mask=padding_mask,
+                        attn_mask=attn_mask,
+                    )
+
+                    if (
+                        li + 1
+                        == self.f3_after
+                    ):
+                        break
+
+                report = self.hob.calibrate(
+                    h.float(),
+                    e_pair.float(),
+                    ~padding_mask,
+                    target=target,
+                    force=force,
+                )
+
+            return report
+
+        finally:
+            if trimmer_counter is not None:
+                self.trimmer._counter.copy_(
+                    trimmer_counter
+                )
+
+            self.train(was_training)
+
+    @torch.no_grad()
+    def calibration_diagnostics(
+        self,
+        x,
+        v=None,
+        mask=None,
+        uu=None,
+        uu_idx=None,
+    ):
+        """
+        Non-mutating calibration diagnostic on a real model input.
+
+        Runs:
+            Weaver-preprocessed batch
+            -> ParT trimmer/prelude
+            -> particle blocks 1..f3_after
+            -> F3 initialization statistics
+
+        No F3 weights are changed.
+        """
+        was_training = self.training
+
+        # SequenceTrimmer increments its warmup counter even
+        # during early eval calls. Preserve it so diagnostics
+        # cannot alter the future training trajectory.
+        trimmer_counter = None
+
+        if hasattr(
+            self.trimmer,
+            "_counter",
+        ):
+            trimmer_counter = (
+                self.trimmer._counter.detach()
+                .clone()
+            )
+
+        self.eval()
+
+        try:
+            with torch.autocast(
+                device_type=x.device.type,
+                enabled=False,
+            ):
+                x_in = x.float()
+
+                v_in = (
+                    None
+                    if v is None
+                    else v.float()
+                )
+
+                uu_in = uu
+                if (
+                    uu is not None
+                    and torch.is_floating_point(uu)
+                ):
+                    uu_in = uu.float()
+
+                (
+                    h,
+                    padding_mask,
+                    e_pair,
+                    attn_mask,
+                ) = self._prelude(
+                    x_in,
+                    v_in,
+                    mask,
+                    uu_in,
+                    uu_idx,
+                )
+
+                # Exactly the states F3 sees in production.
+                for li, block in enumerate(
+                    self.blocks
+                ):
+                    h = block(
+                        h,
+                        padding_mask=padding_mask,
+                        attn_mask=attn_mask,
+                    )
+
+                    if (
+                        li + 1
+                        == self.f3_after
+                    ):
+                        break
+
+                report = (
+                    self.hob
+                    .calibration_diagnostics(
+                        h.float(),
+                        e_pair.float(),
+                        ~padding_mask,
+                    )
+                )
+
+            return report
+
+        finally:
+            if trimmer_counter is not None:
+                self.trimmer._counter.copy_(
+                    trimmer_counter
+                )
+
+            self.train(was_training)
 
 
 @torch.no_grad()

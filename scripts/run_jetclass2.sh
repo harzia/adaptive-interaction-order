@@ -33,7 +33,7 @@ OUTPUT_VOL_DIR="${OUTPUT_PATH}"
 
 
 MODEL_NAME=${1:-}
-if ! [[ "${MODEL_NAME}" =~ ^(ParT|AdaParT|F3ParT)$ ]]; then
+if ! [[ "${MODEL_NAME}" =~ ^(ParT|AdaParT|F3ParT|F3ParTDiag)$ ]]; then
     echo "Invalid model ${MODEL_NAME:-<empty>}! Valid options: ParT, AdaParT, F3ParT."
     exit 1
 fi
