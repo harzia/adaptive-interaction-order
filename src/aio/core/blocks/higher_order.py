@@ -12,7 +12,7 @@ import torch, torch.nn as nn
 
 from ..interactions.factors import Factors
 from ..interactions.motifs import Motif, TRIANGLE
-from ..routing.anchors import anchors, topk_anchors, gather
+from ..routing.anchors import anchors, topk_indices, gather
 
 
 class HigherOrderBlock(nn.Module):
@@ -37,15 +37,16 @@ class HigherOrderBlock(nn.Module):
         self.register_buffer("calibrated", torch.tensor(False))
 
     def forward(self, h, e_pair, mask, rho=None, anc=None, gate=None, cand_mask=None):
-        rbar, g, n, cfac = self.factors(h, e_pair, self.needs_rbar)
-        if anc is None:
-            anc = anchors(mask)
-            if rho is not None and rho < 1:
-                assert self.use_router, "routing requested but the router is frozen (use_router=False)"
-                anc = topk_anchors(self.router(gather(rbar, anc)).squeeze(-1).detach().float(), anc, mask.shape[0], rho)
-        delta_a, anc, aux = self.motif(rbar, g, n, mask, cfac, anc, gate, cand_mask)
+        e_hat, g, n, cfac = self.factors(h, e_pair)                          # dense: ê [B,N,N,d_b], g [B,N,N,D]
+        anc_all = anchors(mask) if anc is None else anc
+        rbar = self.factors.rbar_at(e_hat, h, anc_all) if self.needs_rbar else None   # [A,d_r], never dense
+        if anc is None and rho is not None and rho < 1:
+            assert self.use_router, "routing requested but the router is frozen (use_router=False)"
+            sel = topk_indices(self.router(rbar).squeeze(-1).detach().float(), anc_all, mask.shape[0], rho)
+            anc_all, rbar = anc_all[sel], rbar[sel]                          # W_q runs on the selection only
+        delta_a, anc_out, aux = self.motif(rbar, g, n, mask, cfac, anc_all, gate, cand_mask)
         aux["rbar"] = rbar
-        return delta_a, anc, aux
+        return delta_a, anc_out, aux
 
     @torch.no_grad()
     def calibrate(self, h, e_pair, mask, target=1.0, force=False):
@@ -55,7 +56,7 @@ class HigherOrderBlock(nn.Module):
         if bool(self.calibrated) and not force:
             return {"skipped": True}
         diag, self.motif.diagnostics = self.motif.diagnostics, True
-        rbar, g, n, _ = self.factors(h, e_pair, True)
+        _, g, n, _ = self.factors(h, e_pair)
         pm = mask[:, :, None] & mask[:, None, :]
         sg, sn = g[pm].std(0).clamp_min(1e-6), n[mask].std(0).clamp_min(1e-6)
         for lin, sd in ((self.factors.g[-1], sg), (self.factors.n[-1], sn)):
@@ -98,18 +99,6 @@ class Injection(nn.Module):
                      .index_add(0, b * N + j, attn[b, :, j, i][..., None] * dc)      # [B*N,H,d_r]
         Wm = self.M.weight.view(H, self.dh, -1).to(attn.dtype)
         return torch.einsum("nhr,hdr->nhd", agg, Wm).view(B, N, H, self.dh).permute(0, 2, 1, 3)
-
-
-def attend_with_message(q, k, v, attn_mask, msg_fn=None, dropout_p=0.0, training=False):
-    """q,k,v [B,H,N,dh]; attn_mask additive [B,H,N,N] or None; msg_fn(attn) -> [B,H,N,dh] or None."""
-    s = q @ k.transpose(-2, -1) / math.sqrt(q.shape[-1])
-    if attn_mask is not None: s = s + attn_mask
-    sdt = torch.float32 if s.dtype in (torch.float16, torch.bfloat16) else s.dtype
-    a = torch.nan_to_num(torch.softmax(s.to(sdt), -1)).to(v.dtype)              # fully-masked rows -> 0
-    if dropout_p > 0 and training: a = nn.functional.dropout(a, dropout_p)
-    out = a @ v
-    return out + msg_fn(a) if msg_fn is not None else out
-
 
 
 def attend_with_message(q, k, v, attn_mask, msg_fn=None, dropout_p=0.0, training=False):

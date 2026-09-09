@@ -80,5 +80,3 @@ def _logit_stats(s, a, km):
     std = (((s - mu[:, None]) ** 2 * kmf).sum(1) / cnt).sqrt()
     ent = -(a * torch.log(a.clamp_min(1e-12)) * kmf).sum(1) / torch.log(cnt.clamp_min(2))
     return torch.cat([std, ent], -1).detach()
-
-

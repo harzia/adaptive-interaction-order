@@ -15,16 +15,22 @@ def anchors(mask):
     return (mask[:, :, None] & mask[:, None, :] & tri[None]).nonzero()
 
 
-def topk_anchors(scores, anc, B, rho):
-    """Per-sample top-⌊ρE_b⌋ of a flat anchor list (§2.6).  Returns the selected sub-list only."""
+def topk_indices(scores, anc, B, rho):
+    """Per-sample top-⌊ρE_b⌋ of a flat anchor list (§2.6): indices into `anc` (and into anything aligned
+    with it, e.g. r̄).  Budgets are computed in double precision, never in the score dtype."""
     b = anc[:, 0]
-    k = torch.floor(rho * torch.bincount(b, minlength=B).double()).long()      # never in the score dtype
+    k = torch.floor(rho * torch.bincount(b, minlength=B).double()).long()
     perm = torch.argsort(scores, descending=True)
     perm = perm[torch.argsort(b[perm], stable=True)]            # grouped by sample, score-descending within
     bs = b[perm]
     counts = torch.bincount(bs, minlength=B); starts = torch.cumsum(counts, 0) - counts
     rank = torch.arange(perm.numel(), device=anc.device) - starts[bs]
-    return anc[perm[rank < k[bs]]]
+    return perm[rank < k[bs]]
+
+
+def topk_anchors(scores, anc, B, rho):
+    """Selected sub-list of anchors (see topk_indices)."""
+    return anc[topk_indices(scores, anc, B, rho)]
 
 
 def gather(x, anc):                                # x [B,N,N,C] -> [A,C]
@@ -36,4 +42,3 @@ def scatter_sym(vals, anc, B, N):                  # [A,C] -> [B,N,N,C], both or
     out = vals.new_zeros(B * N * N, vals.shape[1])
     out = out.index_add(0, (b * N + i) * N + j, vals).index_add(0, (b * N + j) * N + i, vals)
     return out.view(B, N, N, -1)
-

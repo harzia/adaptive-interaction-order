@@ -18,23 +18,27 @@ from aio.models.jets.particle_transformer import (ParticleTransformer, PairEmbed
 # ---------------------------------------------------------------- pair-feature tap
 class PairEmbedTap(PairEmbed):
     """`self.embed` ends with [Conv1d(64->H), BatchNorm1d]; the 64-d post-GELU hidden is `embed[:-2]`.
-    Returns cat([hidden, head_bias]) so the existing dense/sparse scatter logic writes both."""
+    The bottleneck ê = W_b·hidden (64 -> d_b) is applied *before* the scatter, so the 64-channel hidden is
+    never materialised densely: the tap emits d_b + H channels and the existing dense/sparse scatter logic
+    writes both.  `split` returns two contiguous tensors so the joint allocation is freed."""
 
     @classmethod
-    def convert(cls, pe):
+    def convert(cls, pe, d_b=16):
         pe.__class__ = cls
-        pe.hidden_dim, pe.head_dim_out = pe.embed[-2].in_channels, pe.out_dim
-        pe.out_dim = pe.hidden_dim + pe.head_dim_out
+        hid = pe.embed[-2].in_channels
+        pe.bottleneck = torch.nn.Conv1d(hid, d_b, 1, bias=False)              # a Linear on (B, C, pairs)
+        pe.pair_dim, pe.head_dim_out = d_b, pe.out_dim
+        pe.out_dim = d_b + pe.head_dim_out                                     # scatter logic reused unchanged
         return pe
 
     def _embed_pairs(self, x, uu):
         hid = self.embed[:-2](x); out = self.embed[-2:](hid)
         if uu is not None:
             fh = self.fts_embed[:-2](uu); hid, out = hid + fh, out + self.fts_embed[-2:](fh)
-        return torch.cat([hid, out], 1)
+        return torch.cat([self.bottleneck(hid), out], 1)
 
-    def split(self, y):                             # (B,64+H,P,P) -> e_pair (B,P,P,64), bias (B,H,P,P)
-        return y[:, :self.hidden_dim].permute(0, 2, 3, 1).contiguous(), y[:, self.hidden_dim:]
+    def split(self, y):                             # (B,d_b+H,P,P) -> e_pair (B,P,P,d_b), bias (B,H,P,P)
+        return y[:, :self.pair_dim].permute(0, 2, 3, 1).contiguous(), y[:, self.pair_dim:].contiguous()
 
 
 # ---------------------------------------------------------------- attention / block
@@ -110,13 +114,14 @@ class AIOParticleTransformer(ParticleTransformer):
                  use_router=False, diagnostics=False, **kw):
         super().__init__(*a, **kw)
         spec = SPECS[spec] if isinstance(spec, str) else spec
-        tap = PairEmbedTap.convert(self.pair_embed)
+        tap = PairEmbedTap.convert(self.pair_embed, d_b=16)
         for blk in self.blocks:
             blk.__class__, blk.attn.__class__ = AIOBlock, AIOAttention
         d, H = self.blocks[0].embed_dim, self.blocks[0].num_heads
         self.f3_after = f3_after
-        self.hob = HigherOrderBlock(d, tap.hidden_dim, spec=spec, D=D, H=H3, d_r=d_r, anchor_chunk=anchor_chunk,
-                                    dense_matmul=dense_matmul, use_router=use_router, diagnostics=diagnostics)
+        self.hob = HigherOrderBlock(d, tap.pair_dim, spec=spec, D=D, H=H3, d_r=d_r, d_b=tap.pair_dim,
+                                    anchor_chunk=anchor_chunk, dense_matmul=dense_matmul, use_router=use_router,
+                                    diagnostics=diagnostics)
         self.inj = Injection(d_r, H, d)
         self.use_f3, self.rho, self.anc, self.gate, self.cand_mask = True, None, None, None, None
         self.last = None
@@ -125,7 +130,7 @@ class AIOParticleTransformer(ParticleTransformer):
         """Warm start from a completed baseline checkpoint (§4.4 continued-training control only — not needed
         when training from scratch).  The only keys allowed to be missing are the new modules'."""
         missing, unexpected = self.load_state_dict(state_dict, strict=False)
-        bad = [k for k in missing if not (k.startswith("hob.") or k.startswith("inj."))]
+        bad = [k for k in missing if not k.startswith(("hob.", "inj.", "pair_embed.bottleneck."))]
         assert not bad and not unexpected, f"checkpoint mismatch: missing={bad} unexpected={unexpected}"
         return missing
 
@@ -140,16 +145,16 @@ class AIOParticleTransformer(ParticleTransformer):
         return x, padding_mask, e_pair, attn_mask
 
     def _forward_encoder(self, x, v=None, mask=None, uu=None, uu_idx=None):
-        """Mirror of upstream _forward_encoder; the lines marked AIO are the additions.  Returns (x, padding_mask)."""
+        """Mirror of upstream _forward_encoder; the lines marked AIO are the additions."""
         x, padding_mask, e_pair, attn_mask = self._prelude(x, v, mask, uu, uu_idx)
         msg_fn, self.last = None, None
         for li, block in enumerate(self.blocks):
             x = block(x, padding_mask=padding_mask, attn_mask=attn_mask, msg_fn=msg_fn)
-            if self.use_f3 and li + 1 == self.f3_after:                   # AIO: Δr from this block's output
+            if self.use_f3 and li + 1 == self.f3_after:                       # AIO: Δr from this block's output
                 B, N = padding_mask.shape
                 delta_a, anc_sel, aux = self.hob(x, e_pair, ~padding_mask, self.rho, self.anc, self.gate, self.cand_mask)
                 self.last = {"delta_a": delta_a, "anc": anc_sel, **aux}
-                if anc_sel.shape[0]:                                      # zero-selection: host untouched
+                if anc_sel.shape[0]:                                          # zero-selection: host untouched
                     attn_mask = attn_mask + self.inj.bias(delta_a, anc_sel, B, N)
                     msg_fn = lambda a, d=delta_a, s=anc_sel: self.inj.message(a, d, s)
         return x, padding_mask
@@ -159,7 +164,7 @@ class AIOParticleTransformer(ParticleTransformer):
         """Run once at init (per seed), on a real batch, in fp32: block-4 states and post-trimmer pair features go
         to HigherOrderBlock.calibrate.  Sets hob.calibrated (saved in the state dict; a second call is a no-op)."""
         was_training = self.training; self.eval()
-        with torch.autocast(device_type="cuda", enabled=False):
+        with torch.autocast(device_type=x.device.type, enabled=False):        # fp32 regardless of the caller
             x, padding_mask, e_pair, attn_mask = self._prelude(x.float(), None if v is None else v.float(), mask, uu, uu_idx)
             for li, block in enumerate(self.blocks):
                 x = block(x, padding_mask=padding_mask, attn_mask=attn_mask)

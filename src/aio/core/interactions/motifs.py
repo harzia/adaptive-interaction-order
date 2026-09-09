@@ -81,7 +81,7 @@ class Motif(nn.Module):
             else: groups.setdefault(p.S, []).append(u)
         ck = self.ckpt and self.training and torch.is_grad_enabled()
         for S, members in groups.items():
-            q = [gather(self.Wq[str(u)](rbar), anc) if self.uniq[u].attended else None for u in members]
+            q = [self.Wq[str(u)](rbar) if self.uniq[u].attended else None for u in members]   # rbar: [A,d_r]
             parts = [[] for _ in members]
             for s0 in range(0, anc.shape[0], self.chunk):
                 sl = slice(s0, s0 + self.chunk)
@@ -102,9 +102,11 @@ class Motif(nn.Module):
         return torch.einsum(self.einsum, *mixed)
 
     def forward(self, rbar, g, n, mask, cfac=None, anc=None, gate=None, cand_mask=None):
-        """Returns delta_a [A,d_out] for the anchors in anc (default: all valid pairs), anc, aux."""
+        """rbar is per anchor, [A,d_r], aligned with anc (a dense [B,N,N,d_r] is accepted and gathered once).
+        Returns delta_a [A,d_out] for the anchors in anc (default: all valid pairs), anc, aux."""
         cfac, cmask = cfac or {}, mask if cand_mask is None else (mask & cand_mask)
         anc = anchors(mask) if anc is None else anc
+        if rbar is not None and rbar.dim() == 4: rbar = gather(rbar, anc)
         if anc.shape[0] == 0:                                                # zero-selection fast path
             return g.new_zeros(0, self.U.out_features), anc, {"pools": [], "stats": None}
         vals, stats = self.pools(rbar, g, n, mask, cmask, cfac, anc)
