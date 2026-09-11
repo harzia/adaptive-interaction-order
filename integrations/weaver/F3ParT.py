@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
+import os
 import time
 from collections import Counter, defaultdict
 from functools import partial
+from pathlib import Path
 
 import awkward as ak
 import matplotlib as mpl
@@ -10,6 +13,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import tqdm
+from torch.profiler import ProfilerActivity, profile, record_function
 
 mpl.use("Agg")
 
@@ -25,6 +29,382 @@ from weaver.utils.nn.tools import (
 
 
 from aio.models.jets.particle_transformer_aio import AIOParticleTransformer
+
+
+def _profiler_event_time_us(event, preferred: str, fallback: str) -> float:
+    value = getattr(event, preferred, None)
+    if value is None:
+        value = getattr(event, fallback, 0.0)
+    return float(value)
+
+
+def _install_aio_profile_ranges(base_model):
+    """
+    Add record_function ranges at runtime, so profiling needs no edits to AIO
+    source files.  The motif _chunk wrapper is also seen during activation-
+    checkpoint recomputation in backward.
+    """
+    aio = base_model.mod
+    originals = []
+
+    def wrap(obj, attr: str, label: str):
+        original = getattr(obj, attr)
+
+        def wrapped(*args, **kwargs):
+            with record_function(label):
+                return original(*args, **kwargs)
+
+        setattr(obj, attr, wrapped)
+        originals.append((obj, attr, original))
+
+    wrap(aio, "_prelude", "aio/prelude")
+    wrap(aio, "_forward_encoder", "aio/encoder")
+    wrap(aio, "_forward_aggregator", "aio/aggregator")
+
+    if aio.fc is not None:
+        wrap(aio.fc, "forward", "aio/classifier")
+
+    for index, block in enumerate(aio.blocks, start=1):
+        wrap(block, "forward", f"aio/block_{index}")
+
+    wrap(aio.hob, "forward", "aio/f3_hob")
+    wrap(aio.hob.factors, "forward", "aio/f3/factors")
+    wrap(aio.hob.factors, "rbar_at", "aio/f3/rbar")
+    wrap(aio.hob.motif, "forward", "aio/f3/motif")
+    wrap(aio.hob.motif, "pools", "aio/f3/motif_pools")
+    wrap(aio.hob.motif, "_chunk", "aio/f3/motif_chunk")
+    wrap(aio.hob.motif, "contract", "aio/f3/motif_contract")
+    wrap(aio.inj, "bias", "aio/f3/inject_bias")
+    wrap(aio.inj, "message", "aio/f3/inject_message")
+
+    return originals
+
+
+def _restore_aio_profile_ranges(originals):
+    for obj, attr, original in reversed(originals):
+        setattr(obj, attr, original)
+
+
+def _profile_f3_training_steps(
+    *,
+    base_model,
+    model,
+    loss_func,
+    opt,
+    scheduler,
+    train_loader,
+    dev,
+    grad_scaler,
+    extra_args,
+    num_steps: int,
+):
+    """
+    Profile a few real Weaver training steps.
+
+    Outputs:
+      f3_profile_rankN.json             Chrome/PyTorch trace
+      f3_profile_rankN_summary.json     named-range totals + throughput/memory
+      f3_profile_rankN_operators.txt    top low-level profiler operators
+    """
+    model.train()
+    data_config = train_loader.dataset.config
+    clip_grad_norm = getattr(opt, "_clip_grad_norm", float("inf"))
+    enable_autocast, autocast_dtype = get_autocast_config(
+        extra_args["args"]
+    )
+
+    distributed = (
+        torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+    )
+    rank = torch.distributed.get_rank() if distributed else 0
+
+    output_dir = Path(
+        os.environ.get("AIO_PROFILE_DIR", "profiles/f3")
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    activities = [ProfilerActivity.CPU]
+    if torch.cuda.is_available():
+        activities.append(ProfilerActivity.CUDA)
+        torch.cuda.reset_peak_memory_stats(dev)
+
+    originals = _install_aio_profile_ranges(base_model)
+    iterator = iter(train_loader)
+    processed_entries = 0
+    completed_steps = 0
+
+    _logger.info(
+        "AIO profiler: profiling %d real training steps on rank %d; "
+        "output directory: %s",
+        num_steps,
+        rank,
+        output_dir,
+    )
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize(dev)
+    wall_start = time.perf_counter()
+
+    try:
+        with profile(
+            activities=activities,
+            record_shapes=True,
+            profile_memory=True,
+            with_flops=True,
+            with_stack=False,
+        ) as prof:
+            for _ in range(num_steps):
+                with record_function("weaver/data_wait"):
+                    try:
+                        X, y, _ = next(iterator)
+                    except StopIteration:
+                        break
+
+                with record_function("weaver/h2d"):
+                    inputs = [
+                        X[name].to(dev)
+                        for name in data_config.input_names
+                    ]
+                    label = y[
+                        data_config.label_names[0]
+                    ].long().to(dev)
+                    try:
+                        label_mask = y[
+                            data_config.label_names[0] + "_mask"
+                        ].bool().to(dev)
+                    except KeyError:
+                        label_mask = None
+
+                processed_entries += int(label.shape[0])
+
+                with record_function("weaver/zero_grad"):
+                    opt.zero_grad()
+
+                with record_function("weaver/forward_loss"):
+                    with torch.autocast(
+                        "cuda",
+                        enabled=enable_autocast,
+                        dtype=autocast_dtype,
+                    ):
+                        model_output = model(*inputs)
+                        logits, flat_label, _ = _flatten_preds(
+                            model_output,
+                            label=label,
+                            mask=label_mask,
+                        )
+                        loss = loss_func(logits, flat_label)
+
+                if grad_scaler is None:
+                    with record_function("weaver/backward"):
+                        loss.backward()
+
+                    with record_function("weaver/grad_clip"):
+                        torch.nn.utils.clip_grad_norm_(
+                            model.parameters(),
+                            max_norm=clip_grad_norm,
+                        )
+
+                    with record_function("weaver/optimizer_step"):
+                        opt.step()
+                else:
+                    with record_function("weaver/backward"):
+                        grad_scaler.scale(loss).backward()
+
+                    with record_function("weaver/grad_clip"):
+                        grad_scaler.unscale_(opt)
+                        torch.nn.utils.clip_grad_norm_(
+                            model.parameters(),
+                            max_norm=clip_grad_norm,
+                        )
+
+                    with record_function("weaver/optimizer_step"):
+                        grad_scaler.step(opt)
+                        grad_scaler.update()
+
+                if (
+                    scheduler
+                    and getattr(
+                        scheduler,
+                        "_update_per_step",
+                        False,
+                    )
+                ):
+                    with record_function("weaver/scheduler_step"):
+                        scheduler.step()
+
+                completed_steps += 1
+                prof.step()
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(dev)
+        wall_seconds = time.perf_counter() - wall_start
+
+        trace_path = (
+            output_dir / f"f3_profile_rank{rank}.json"
+        )
+        prof.export_chrome_trace(str(trace_path))
+
+        averages = prof.key_averages(
+            group_by_input_shape=False
+        )
+
+        ranges = []
+        for event in averages:
+            if not (
+                event.key.startswith("aio/")
+                or event.key.startswith("weaver/")
+            ):
+                continue
+
+            ranges.append(
+                {
+                    "name": event.key,
+                    "calls": int(event.count),
+                    "cpu_total_ms": (
+                        float(event.cpu_time_total) / 1000.0
+                    ),
+                    "cpu_self_ms": (
+                        float(event.self_cpu_time_total) / 1000.0
+                    ),
+                    "device_total_ms": (
+                        _profiler_event_time_us(
+                            event,
+                            "device_time_total",
+                            "cuda_time_total",
+                        )
+                        / 1000.0
+                    ),
+                    "device_self_ms": (
+                        _profiler_event_time_us(
+                            event,
+                            "self_device_time_total",
+                            "self_cuda_time_total",
+                        )
+                        / 1000.0
+                    ),
+                }
+            )
+
+        ranges.sort(
+            key=lambda row: row["device_total_ms"],
+            reverse=True,
+        )
+
+        peak_cuda_memory_mb = None
+        if torch.cuda.is_available():
+            peak_cuda_memory_mb = float(
+                torch.cuda.max_memory_allocated(dev)
+                / 1024.0**2
+            )
+
+        summary = {
+            "rank": int(rank),
+            "requested_steps": int(num_steps),
+            "completed_steps": int(completed_steps),
+            "processed_entries": int(processed_entries),
+            "wall_seconds": float(wall_seconds),
+            "seconds_per_step": (
+                float(wall_seconds / completed_steps)
+                if completed_steps
+                else None
+            ),
+            "entries_per_second": (
+                float(processed_entries / wall_seconds)
+                if wall_seconds > 0
+                else None
+            ),
+            "peak_cuda_memory_mb": peak_cuda_memory_mb,
+            "note": (
+                "Named ranges are nested totals; do not sum them. "
+                "Profiler instrumentation adds overhead, so use these "
+                "primarily for relative attribution."
+            ),
+            "ranges": ranges,
+        }
+
+        summary_path = (
+            output_dir
+            / f"f3_profile_rank{rank}_summary.json"
+        )
+        summary_path.write_text(
+            json.dumps(summary, indent=2)
+        )
+
+        sort_key = (
+            "self_cuda_time_total"
+            if torch.cuda.is_available()
+            else "self_cpu_time_total"
+        )
+        operator_table = averages.table(
+            sort_by=sort_key,
+            row_limit=80,
+        )
+
+        operators_path = (
+            output_dir
+            / f"f3_profile_rank{rank}_operators.txt"
+        )
+        operators_path.write_text(operator_table)
+
+        _logger.info(
+            "AIO profiler top operators:\n%s",
+            operator_table,
+        )
+        _logger.info(
+            "AIO profiler named ranges "
+            "(nested totals; do not sum):\n%s",
+            "\n".join(
+                (
+                    f"  {row['name']:<30} "
+                    f"calls={row['calls']:<5d} "
+                    f"device_total="
+                    f"{row['device_total_ms']:.3f} ms "
+                    f"cpu_total="
+                    f"{row['cpu_total_ms']:.3f} ms"
+                )
+                for row in ranges
+            ),
+        )
+        _logger.info(
+            "AIO profiler: %d steps, %.2f s wall, "
+            "%.3f s/step, %.2f entries/s, "
+            "peak CUDA memory=%s MB",
+            completed_steps,
+            wall_seconds,
+            (
+                wall_seconds / completed_steps
+                if completed_steps
+                else float("nan")
+            ),
+            (
+                processed_entries / wall_seconds
+                if wall_seconds > 0
+                else float("nan")
+            ),
+            (
+                f"{peak_cuda_memory_mb:.1f}"
+                if peak_cuda_memory_mb is not None
+                else "n/a"
+            ),
+        )
+        _logger.info(
+            "AIO profiler trace: %s",
+            trace_path,
+        )
+        _logger.info(
+            "AIO profiler summary: %s",
+            summary_path,
+        )
+        _logger.info(
+            "AIO profiler operators: %s",
+            operators_path,
+        )
+
+    finally:
+        _restore_aio_profile_ranges(originals)
+
+
 
 
 class AIOParticleTransformerWrapper(torch.nn.Module):
@@ -1014,6 +1394,33 @@ def train_classification_with_f3_calibration(
         train_iterator,
         train_loader,
     )
+
+    profile_steps = int(
+        os.environ.get("AIO_PROFILE_STEPS", "0")
+    )
+    if profile_steps > 0:
+        if epoch != 0:
+            raise RuntimeError(
+                "AIO_PROFILE_STEPS is intended for an epoch-0 "
+                "throwaway profiling run."
+            )
+
+        _profile_f3_training_steps(
+            base_model=base_model,
+            model=model,
+            loss_func=loss_func,
+            opt=opt,
+            scheduler=scheduler,
+            train_loader=replay_loader,
+            dev=dev,
+            grad_scaler=grad_scaler,
+            extra_args=extra_args,
+            num_steps=profile_steps,
+        )
+
+        # Avoid immediately entering the normal multi-hour validation pass.
+        # SystemExit(0) makes the profiling job terminate successfully.
+        raise SystemExit(0)
 
     return train_classification(
         model,
