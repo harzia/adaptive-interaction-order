@@ -149,9 +149,9 @@ def _profile_f3_training_steps(
     try:
         with profile(
             activities=activities,
-            record_shapes=True,
-            profile_memory=True,
-            with_flops=True,
+            record_shapes=False,
+            profile_memory=False,
+            with_flops=False,
             with_stack=False,
         ) as prof:
             for _ in range(num_steps):
@@ -240,10 +240,10 @@ def _profile_f3_training_steps(
             torch.cuda.synchronize(dev)
         wall_seconds = time.perf_counter() - wall_start
 
-        trace_path = (
-            output_dir / f"f3_profile_rank{rank}.json"
-        )
-        prof.export_chrome_trace(str(trace_path))
+        # trace_path = (
+        #     output_dir / f"f3_profile_rank{rank}.json"
+        # )
+        # prof.export_chrome_trace(str(trace_path))
 
         averages = prof.key_averages(
             group_by_input_shape=False
@@ -388,10 +388,10 @@ def _profile_f3_training_steps(
                 else "n/a"
             ),
         )
-        _logger.info(
-            "AIO profiler trace: %s",
-            trace_path,
-        )
+        # _logger.info(
+        #     "AIO profiler trace: %s",
+        #     trace_path,
+        # )
         _logger.info(
             "AIO profiler summary: %s",
             summary_path,
