@@ -25,6 +25,34 @@ DEVICE = torch.device(os.environ.get("AIO_TEST_DEVICE", "cpu"))
 torch.set_num_threads(1)
 
 
+@pytest.fixture(scope="module", autouse=True)
+def cuda_reference_precision():
+    """Use IEEE FP32 for reference checks; leave the production/BF16 kernel policy unchanged.
+
+    CUDA convolutions may otherwise use TF32 even when the test says bf16=False. These flags
+    belong only to the test process, and are restored at the end of the module.
+    """
+    if DEVICE.type != "cuda":
+        yield
+        return
+    matmul = torch.backends.cuda.matmul
+    conv = torch.backends.cudnn.conv
+    old_matmul, old_conv = matmul.fp32_precision, conv.fp32_precision
+    old_benchmark = torch.backends.cudnn.benchmark
+    print(f"\nNumerical checks: torch={torch.__version__}, GPU={torch.cuda.get_device_name(DEVICE)}, "
+          f"incoming matmul={old_matmul}, conv={old_conv}, "
+          f"BF16 reduced-precision reduction={matmul.allow_bf16_reduced_precision_reduction}")
+    try:
+        matmul.fp32_precision = "ieee"
+        conv.fp32_precision = "ieee"
+        torch.backends.cudnn.benchmark = False
+        print("FP32 reference policy: matmul=ieee, conv=ieee; BF16 reduction setting retained")
+        yield
+    finally:
+        matmul.fp32_precision, conv.fp32_precision = old_matmul, old_conv
+        torch.backends.cudnn.benchmark = old_benchmark
+
+
 def legacy_pools(self, rbar, g, n, mask, cmask, cfac, anc):
     """Original full-batch gathers and independent query slices, retained only as a test oracle."""
     vals, diag, groups = [None] * len(self.uniq), {}, {}
@@ -56,26 +84,37 @@ def legacy_pools(self, rbar, g, n, mask, cmask, cfac, anc):
                   "entropy": {u: v[:, self.H:] for u, v in stats.items()}}
 
 
-def close(actual, expected, bf16=False):
+def close(actual, expected, bf16=False, label="tensor"):
     if actual is None or expected is None:
-        assert actual is None and expected is None
+        assert actual is None and expected is None, f"{label}: missing gradient in only one implementation"
         return
-    torch.testing.assert_close(actual, expected, rtol=0.04 if bf16 else 2e-5,
-                               atol=2e-3 if bf16 else 2e-6)
+    double = actual.dtype == torch.float64
+    torch.testing.assert_close(actual, expected, rtol=0.04 if bf16 else (1e-9 if double else 2e-5),
+                               atol=2e-3 if bf16 else (1e-10 if double else 2e-6),
+                               msg=lambda detail: f"{label}\n{detail}")
 
 
-def close_reduction(actual, expected, tolerance=0.02):
+def close_reduction(actual, expected, tolerance=0.02, label="reduction"):
     """BF16 reductions change rounding order; cancellation makes elementwise relative error unhelpful.
 
     Bound both the relative L2 error and the largest error relative to the tensor's largest value.
     FP32 tests separately compare every element of every gradient with tight tolerances.
     """
+    if actual is None or expected is None:
+        close(actual, expected, label=label)
+        return
+    assert actual.shape == expected.shape, f"{label}: different shapes"
     actual, expected = actual.float(), expected.float()
-    assert torch.isfinite(actual).all() and torch.isfinite(expected).all()
+    assert torch.isfinite(actual).all() and torch.isfinite(expected).all(), f"{label}: nonfinite values"
     if actual.numel():
         error = actual - expected
-        assert error.norm() <= tolerance * expected.norm() + 1e-6
-        assert error.abs().max() <= tolerance * expected.abs().max() + 1e-6
+        error_l2, reference_l2 = error.norm().item(), expected.norm().item()
+        max_abs, reference_max = error.abs().max().item(), expected.abs().max().item()
+        detail = (f"{label}: max_abs={max_abs:.7g}, relative_l2={error_l2 / max(reference_l2, 1e-30):.7g}, "
+                  f"max_error/reference_max={max_abs / max(reference_max, 1e-30):.7g}, "
+                  f"tolerance={tolerance}")
+        assert error_l2 <= tolerance * reference_l2 + 1e-6, detail
+        assert max_abs <= tolerance * reference_max + 1e-6, detail
 
 
 SPECS = [TRIANGLE, SUMMED_TRIANGLE, TAIL, CHAIN, K4,
@@ -125,14 +164,16 @@ def test_grouped_pools_outputs_and_gradients(spec, ckpt, bf16, group_size=2, den
 
     expected, old_aux, old_grads = run(reference)
     actual, aux, grads = run(model)
-    close(actual, expected, bf16)
-    for v, ref in zip(aux["pools"], old_aux["pools"]):
-        close(v, ref, bf16)
+    close(actual, expected, bf16, label="motif output")
+    for u, (v, ref) in enumerate(zip(aux["pools"], old_aux["pools"])):
+        close(v, ref, bf16, label=f"pool[{u}]")
     for name in ("logit_std", "entropy"):
         for u in aux["stats"][name]:
-            close(aux["stats"][name][u], old_aux["stats"][name][u], bf16)
-    for v, ref in zip(grads, old_grads):
-        close(v, ref, bf16)
+            close(aux["stats"][name][u], old_aux["stats"][name][u], bf16, label=f"{name}[{u}]")
+    names = ["rbar", "g", "n", *(f"bond[{b}]" for b in bonds), "gate", *dict(model.named_parameters())]
+    compare = close_reduction if bf16 else close
+    for name, v, ref in zip(names, grads, old_grads):
+        compare(v, ref, label=f"motif gradient:{name}")
 
 
 @pytest.mark.parametrize("group_size", [0, 1, 16])
@@ -217,11 +258,13 @@ def batch():
 
 
 @pytest.mark.parametrize("bf16", [False, True])
-def test_model_training_outputs_gradients_and_batchnorm(bf16):
+def test_model_training_outputs_gradients_and_batchnorm(bf16, fp64=False):
     torch.manual_seed(303)
     model = AIOParticleTransformer(**model_config(), f3_after=2, D=8, H3=2, d_r=4,
                                   anchor_chunk=5, jet_group_size=2).to(DEVICE).train()
     model.require_calibration = False
+    if fp64:
+        model.double()
     with torch.no_grad():
         model.hob.motif.U.weight.normal_(std=0.1)
     reference = copy.deepcopy(model)
@@ -230,6 +273,8 @@ def test_model_training_outputs_gradients_and_batchnorm(bf16):
     # Execution options add no checkpoint keys.
     reference.load_state_dict(model.state_dict(), strict=True)
     data = batch()
+    if fp64:
+        data = tuple(t.double() if t.is_floating_point() else t for t in data)
 
     def run(mod):
         x, v, mask = data
@@ -237,7 +282,8 @@ def test_model_training_outputs_gradients_and_batchnorm(bf16):
         torch.manual_seed(404)                      # same host attention/dropout masks
         with torch.autocast(DEVICE.type, dtype=torch.bfloat16, enabled=bf16):
             out = mod(x, v=v, mask=mask)
-            loss = torch.nn.functional.cross_entropy(out.float(), torch.tensor([0, 1, 2, 1, 0], device=DEVICE))
+            loss_input = out if fp64 else out.float()
+            loss = torch.nn.functional.cross_entropy(loss_input, torch.tensor([0, 1, 2, 1, 0], device=DEVICE))
         loss.backward()
         return out, x.grad
 
@@ -245,13 +291,14 @@ def test_model_training_outputs_gradients_and_batchnorm(bf16):
     with patch.object(model.inj, "dense_pairs", wraps=model.inj.dense_pairs) as build:
         actual, xgrad = run(model)
         assert build.call_count == 1                # shared by all three downstream blocks
-    close(actual, expected, bf16)
-    close(xgrad, old_xgrad, bf16)
+    compare = close_reduction if bf16 else close
+    compare(actual, expected, label="model logits")
+    compare(xgrad, old_xgrad, label="model input gradient")
     gradient_groups = {key: ([], []) for key in ("host", "hob", "inj")}
     for (name, prm), (old_name, old_prm) in zip(model.named_parameters(), reference.named_parameters()):
         assert name == old_name
         if not bf16 or prm.grad is None or old_prm.grad is None:
-            close(prm.grad, old_prm.grad)
+            close(prm.grad, old_prm.grad, label=f"model gradient:{name}")
         else:
             group = name.split(".")[0] if name.startswith(("hob.", "inj.")) else "host"
             actual_grads, expected_grads = gradient_groups[group]
@@ -260,12 +307,62 @@ def test_model_training_outputs_gradients_and_batchnorm(bf16):
     if bf16:
         # Near-null BatchNorm/attention biases are especially cancellation-sensitive in BF16.
         # Check host, motif, and injection gradients separately so the large host cannot hide F3 errors.
-        for actual_grads, expected_grads in gradient_groups.values():
-            close_reduction(torch.cat(actual_grads), torch.cat(expected_grads), tolerance=0.05)
+        for name, (actual_grads, expected_grads) in gradient_groups.items():
+            close_reduction(torch.cat(actual_grads), torch.cat(expected_grads), tolerance=0.05,
+                            label=f"model gradients:{name}")
     for (name, buf), (_, ref) in zip(model.named_buffers(), reference.named_buffers()):
         torch.testing.assert_close(buf, ref, rtol=0, atol=0)
     assert model.hob.motif.Wq["0"].weight.grad.abs().max() > 0
     assert model.inj.M.weight.grad.abs().max() > 0
+
+
+def test_model_fp64_reference():
+    """Require much tighter full-model agreement when reduction roundoff is reduced."""
+    test_model_training_outputs_gradients_and_batchnorm(False, fp64=True)
+
+
+@pytest.mark.parametrize("ckpt", [False, True])
+def test_bf16_summed_pool_against_fp64(ckpt):
+    """Independent all-triples reference for the GPU-reported summed-pool gradient failure.
+
+    Both implementations must agree with FP64 differentiation on the same BF16-quantised
+    factors and the same pool cotangent; this does not just compare two BF16 implementations.
+    """
+    torch.manual_seed(104)
+    B, N, D = 5, 6, 8
+    mask = torch.arange(N, device=DEVICE)[None] < torch.tensor([6, 2, 1, 0, 5], device=DEVICE)[:, None]
+    cmask = mask.clone()
+    cmask[:, 3] = False
+    anc = anchors(mask)
+    anc = anc[torch.randperm(len(anc), device=DEVICE)]
+    g = torch.randn(B, N, N, D, device=DEVICE) * 0.5
+    g = ((g + g.transpose(1, 2)) * 0.5).bfloat16()
+    n = (torch.randn(B, N, D, device=DEVICE) * 0.5).bfloat16()
+    probe = torch.randn(len(anc), D, device=DEVICE)
+    gg, nn = g.double().requires_grad_(), n.double().requires_grad_()
+    # Explicit [B,i,j,k,D] reference, safe only for this tiny test. It assumes no leg symmetry.
+    terms = gg[:, :, None] * gg[:, None] * nn[:, None, None]
+    idx = torch.arange(N, device=DEVICE)
+    km = (cmask[:, None, None, :] &
+          (idx[None, :, None, None] != idx[None, None, None, :]) &
+          (idx[None, None, :, None] != idx[None, None, None, :]))
+    all_pairs = (terms * km[..., None]).sum(dim=3)
+    b, i, j = anc.unbind(1)
+    expected = all_pairs[b, i, j]
+    expected_grads = torch.autograd.grad(expected, (gg, nn), probe.double())
+    for legacy in (False, True):
+        model = Motif(SUMMED_TRIANGLE, 4, D, 2, 4, anchor_chunk=4,
+                      jet_group_size=2, ckpt=ckpt).to(DEVICE).train()
+        if legacy:
+            model.pools = MethodType(legacy_pools, model)
+        gg, nn = g.detach().clone().requires_grad_(), n.detach().clone().requires_grad_()
+        with torch.autocast(DEVICE.type, dtype=torch.bfloat16):
+            pools, _ = model.pools(None, gg, nn, mask, cmask, {}, anc)
+        grads = torch.autograd.grad(pools[0], (gg, nn), probe)
+        prefix = "legacy" if legacy else "grouped"
+        close(pools[0], expected.float(), label=f"{prefix} summed pool vs FP64")
+        for name, actual, ref in zip(("g", "n"), grads, expected_grads):
+            close_reduction(actual, ref, label=f"{prefix} summed gradient:{name} vs FP64")
 
 
 def test_zero_initialisation_and_calibration():
