@@ -28,12 +28,15 @@ is_symmetric = lambda spec: all(p.S in ("ij", "") for p in spec)
 
 
 class Motif(nn.Module):
-    def __init__(self, spec: Sequence[PoolSpec], d_r, D, H, d_out, d_mix=None, anchor_chunk=256, ckpt=True,
-                 dense_matmul=False, diagnostics=False):
+    def __init__(self, spec: Sequence[PoolSpec], d_r, D, H, d_out, d_mix=None, anchor_chunk=4096, ckpt=True,
+                 dense_matmul=False, diagnostics=False, jet_group_size=16):
         super().__init__()
         assert D % H == 0 and len(spec) > 0
+        if anchor_chunk <= 0 or jet_group_size < 0:
+            raise ValueError("anchor_chunk must be positive and jet_group_size must be nonnegative")
         self.spec, self.D, self.H, self.da = tuple(spec), D, H, D // H
         self.chunk, self.ckpt, self.dense_matmul, self.diagnostics = anchor_chunk, ckpt, dense_matmul, diagnostics
+        self.jet_group_size = jet_group_size                 # 0 disables grouping (full-batch factors)
         self.uniq: List[PoolSpec] = []; self.slot: List[int] = []        # identical summed pools computed once
         for p in self.spec:
             if not p.attended and p in self.uniq: self.slot.append(self.uniq.index(p))
@@ -72,6 +75,37 @@ class Motif(nn.Module):
             tstd = t.new_zeros(())
         return (*outs, *stats, tstd)
 
+    def _local_chunks(self, g, n, cmask, cfac, anc):
+        """Split each factor ONCE, then gather only from the local jet group.
+
+        Independent slices of the full factors inside the chunk loop would create full-batch
+        gradient contributions again. SplitBackward instead joins the local gradients once.
+        A stable permutation supports arbitrary user-supplied anchor order; outputs are restored
+        before returning, so rbar, gates and diagnostics remain aligned with the caller's anchors.
+        """
+        B = g.shape[0]
+        size = self.jet_group_size or B
+        if size >= B:
+            return [(a, g, n, cmask, cfac) for a in anc.split(self.chunk)], None, None
+
+        group = anc[:, 0] // size
+        perm = torch.argsort(group, stable=True)
+        inverse = torch.empty_like(perm)
+        inverse[perm] = torch.arange(perm.numel(), device=perm.device)
+        # One host transfer for the group sizes, rather than one synchronisation per chunk.
+        counts = torch.bincount(group, minlength=(B + size - 1) // size).tolist()
+        anchor_groups = anc.index_select(0, perm).split(counts)
+        factor_groups = {bd: c.split(size, dim=0) for bd, c in cfac.items()}
+        chunks = []
+        for gi, (ag, gg, ng, mg) in enumerate(zip(
+                anchor_groups, g.split(size, dim=0), n.split(size, dim=0), cmask.split(size, dim=0))):
+            if not ag.shape[0]:
+                continue
+            local = ag - ag.new_tensor([gi * size, 0, 0])
+            cg = {bd: pieces[gi] for bd, pieces in factor_groups.items()}
+            chunks.extend((a, gg, ng, mg, cg) for a in local.split(self.chunk))
+        return chunks, perm, inverse
+
     def pools(self, rbar, g, n, mask, cmask, cfac, anc):
         vals: List[Optional[torch.Tensor]] = [None] * len(self.uniq); diag: Dict[int, list] = {}; tstd = []
         groups: Dict[str, List[int]] = {}
@@ -80,19 +114,29 @@ class Motif(nn.Module):
             elif self.dense_matmul and not p.attended: vals[u] = gather(summed_triangle_dense(g, n, mask, cmask, p.bonds, cfac), anc)
             else: groups.setdefault(p.S, []).append(u)
         ck = self.ckpt and self.training and torch.is_grad_enabled()
+        if groups:
+            chunks, perm, inverse = self._local_chunks(g, n, cmask, cfac, anc)
+            sizes = [a.shape[0] for a, *_ in chunks]
         for S, members in groups.items():
             q = [self.Wq[str(u)](rbar) if self.uniq[u].attended else None for u in members]   # rbar: [A,d_r]
+            # One split per query, not independent q[sl] operations whose backward each spans A.
+            query_chunks = [(None,) * len(chunks) if x is None else
+                            (x if perm is None else x.index_select(0, perm)).split(sizes) for x in q]
             parts = [[] for _ in members]
-            for s0 in range(0, anc.shape[0], self.chunk):
-                sl = slice(s0, s0 + self.chunk)
-                args = (S, members, [None if x is None else x[sl] for x in q], anc[sl], g, n, cmask, cfac)
-                out = checkpoint(self._chunk, *args, use_reentrant=False) if ck else self._chunk(*args)
+            for ci, (ac, gg, ng, mg, cg) in enumerate(chunks):
+                args = (S, members, [x[ci] for x in query_chunks], ac, gg, ng, mg, cg)
+                # _chunk has no random operations; attention dropout lives in the host block.
+                out = checkpoint(self._chunk, *args, use_reentrant=False, preserve_rng_state=False) if ck else self._chunk(*args)
                 for k, u in enumerate(members):
                     parts[k].append(out[k])
                     if self.uniq[u].attended: diag.setdefault(u, []).append(out[len(members) + k])
                 tstd.append(out[-1])
-            for k, u in enumerate(members): vals[u] = torch.cat(parts[k], 0)
+            for k, u in enumerate(members):
+                v = torch.cat(parts[k], 0)
+                vals[u] = v if inverse is None else v.index_select(0, inverse)
         D_ = {u: torch.cat(v, 0) for u, v in diag.items()}                  # [A, 2H] per attended pool (empty if off)
+        if groups and inverse is not None:
+            D_ = {u: v.index_select(0, inverse) for u, v in D_.items()}
         stats = {"logit_std": {u: x[:, :self.H] for u, x in D_.items()}, "entropy": {u: x[:, self.H:] for u, x in D_.items()},
                  "term_std": torch.stack(tstd).mean() if tstd else g.new_zeros(())}
         return vals, stats

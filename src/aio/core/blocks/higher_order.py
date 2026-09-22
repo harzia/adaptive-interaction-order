@@ -1,8 +1,8 @@
 """Higher-order block (spec §6 interface, §2.6 router) and injection into the host (spec §2.5).
 
 HigherOrderBlock: factors + motif + router; F(h, e_pair, mask; spec) -> (delta_a, anc, aux).
-Injection: b3(Δr) scattered from the anchor list into the [B,H,N,N] logits; the message aggregated
-per head over the anchor list before M_h is applied (linearity), so no [B,N,N,d] tensor exists.
+Injection: b3(Δr) scattered from the anchor list into the [B,H,N,N] logits; messages aggregated
+before M_h is applied (linearity), using either sparse anchors or a reusable dense pair tensor.
 """
 from __future__ import annotations
 import math
@@ -12,7 +12,7 @@ import torch, torch.nn as nn
 
 from ..interactions.factors import Factors
 from ..interactions.motifs import Motif, TRIANGLE
-from ..routing.anchors import anchors, topk_indices, gather
+from ..routing.anchors import anchors, topk_indices, gather, scatter_sym
 
 
 class HigherOrderBlock(nn.Module):
@@ -23,11 +23,13 @@ class HigherOrderBlock(nn.Module):
     parameters are frozen for the same reason.  Alternatively wrap DDP with find_unused_parameters=True."""
 
     def __init__(self, d, d_e, spec=TRIANGLE, D=32, H=2, d_r=32, d_b=16, d_v=16, R=4, d_mix=None,
-                 anchor_chunk=256, ckpt=True, dense_matmul=False, use_router=False, diagnostics=False):
+                 anchor_chunk=4096, ckpt=True, dense_matmul=False, use_router=False, diagnostics=False,
+                 jet_group_size=16):
         super().__init__()
         self.spec = tuple(spec)
         self.factors = Factors(d, d_e, D, d_r, d_b, d_v, R, sorted({b for p in self.spec for b in p.bonds}))
-        self.motif = Motif(self.spec, d_r, D, H, d_r, d_mix, anchor_chunk, ckpt, dense_matmul, diagnostics)
+        self.motif = Motif(self.spec, d_r, D, H, d_r, d_mix, anchor_chunk, ckpt, dense_matmul, diagnostics,
+                           jet_group_size=jet_group_size)
         self.router = nn.Sequential(nn.LayerNorm(d_r), nn.Linear(d_r, 1))
         self.use_router = use_router
         self.needs_rbar = use_router or any(p.attended for p in self.spec)
@@ -135,6 +137,28 @@ class Injection(nn.Module):
             b, i, j = anc[s0:s0 + chunk].unbind(1); dc = d[s0:s0 + chunk, None]
             agg = agg.index_add(0, b * N + i, attn[b, :, i, j][..., None] * dc) \
                      .index_add(0, b * N + j, attn[b, :, j, i][..., None] * dc)      # [B*N,H,d_r]
+        Wm = self.M.weight.view(H, self.dh, -1).to(attn.dtype)
+        return torch.einsum("nhr,hdr->nhd", agg, Wm).view(B, N, H, self.dh).permute(0, 2, 1, 3)
+
+    @staticmethod
+    def dense_pairs(delta_a, anc, B, N):
+        """Build R[b,i,j,r] once per higher-order stage; absent pairs and diagonal stay zero.
+
+        scatter_sym sums duplicate anchors just like message(), and keeps gradients to delta_a.
+        Reuse the returned tensor across all downstream blocks, without detaching it.
+        """
+        return scatter_sym(delta_a, anc, B, N)
+
+    def message_dense(self, attn, pairs):
+        """Same message as message(), with a batched contraction over candidate j.
+
+        attn must be the host's post-dropout weights. Batching over (batch, receiving particle)
+        avoids expanding R over heads or materialising a [B,H,N,N,d_r] intermediate.
+        """
+        B, H, N, _ = attn.shape
+        a = attn.permute(0, 2, 1, 3).reshape(B * N, H, N)
+        r = pairs.to(attn.dtype).reshape(B * N, N, pairs.shape[-1])
+        agg = torch.bmm(a, r)                                            # [B*N,H,d_r]
         Wm = self.M.weight.view(H, self.dh, -1).to(attn.dtype)
         return torch.einsum("nhr,hdr->nhd", agg, Wm).view(B, N, H, self.dh).permute(0, 2, 1, 3)
 

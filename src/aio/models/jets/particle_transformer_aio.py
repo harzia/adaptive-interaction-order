@@ -110,21 +110,27 @@ class AIOParticleTransformer(ParticleTransformer):
         use_f3 (True)   rho (None = dense)   anc / gate / cand_mask (None)   — see spec §2.6, §3.1, §5.
         record_last (False): keep branch outputs in `self.last` (use under no_grad; see __init__).
         require_calibration (True): first training forward raises if the stage was never calibrated.
+        message_backend ("auto"): dense messages for the dense pilot, sparse for routed/custom anchors;
+            "dense" and "sparse" force either path. Dense pair updates are built once per stage.
+    `jet_group_size` bounds the factor batch seen by each motif chunk (0 disables grouping).
     `spec` may be a tuple of PoolSpec or one of the names in SPECS (Weaver -o options are strings)."""
 
-    def __init__(self, *a, f3_after=4, spec="triangle", D=32, H3=2, d_r=32, anchor_chunk=256, dense_matmul=False,
-                 use_router=False, diagnostics=False, **kw):
+    def __init__(self, *a, f3_after=4, spec="triangle", D=32, H3=2, d_r=32, anchor_chunk=4096, dense_matmul=False,
+                 use_router=False, diagnostics=False, jet_group_size=16, message_backend="auto", ckpt=True, **kw):
+        if message_backend not in ("auto", "dense", "sparse"):
+            raise ValueError("message_backend must be 'auto', 'dense', or 'sparse'")
         super().__init__(*a, **kw)
         assert not self.include_global_token, "AIO adapter: include_global_token is not supported"
         assert all(self.block_ids_with_attn_mask), "AIO adapter passes the pair bias to every particle block"
         spec = SPECS[spec] if isinstance(spec, str) else spec
         d, H = self.blocks[0].embed_dim, self.blocks[0].num_heads
         self.f3_after = f3_after
+        self.message_backend = message_backend
         with torch.random.fork_rng(devices=[]):
             tap = PairEmbedTap.convert(self.pair_embed, d_b=16)
             self.hob = HigherOrderBlock(d, tap.pair_dim, spec=spec, D=D, H=H3, d_r=d_r, d_b=tap.pair_dim,
                                         anchor_chunk=anchor_chunk, dense_matmul=dense_matmul, use_router=use_router,
-                                        diagnostics=diagnostics)
+                                        diagnostics=diagnostics, jet_group_size=jet_group_size, ckpt=ckpt)
             self.inj = Injection(d_r, H, d)
         for blk in self.blocks:
             blk.__class__, blk.attn.__class__ = AIOBlock, AIOAttention
@@ -168,7 +174,14 @@ class AIOParticleTransformer(ParticleTransformer):
                     self.last = {"delta_a": delta_a, "anc": anc_sel, **aux}
                 if anc_sel.shape[0]:                                          # zero-selection: host untouched
                     attn_mask = attn_mask + self.inj.bias(delta_a, anc_sel, B, N)
-                    msg_fn = lambda a, d=delta_a, s=anc_sel: self.inj.message(a, d, s)
+                    dense = self.message_backend == "dense" or (
+                        self.message_backend == "auto" and self.anc is None and
+                        (self.rho is None or self.rho >= 1))
+                    if dense:
+                        pairs = self.inj.dense_pairs(delta_a, anc_sel, B, N)
+                        msg_fn = lambda a, r=pairs: self.inj.message_dense(a, r)
+                    else:
+                        msg_fn = lambda a, d=delta_a, s=anc_sel: self.inj.message(a, d, s)
         return x, padding_mask
 
     @torch.no_grad()

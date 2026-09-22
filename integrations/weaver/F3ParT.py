@@ -110,7 +110,10 @@ def get_model(data_config, **kwargs):
         f3_after=4,
         spec="triangle",
         D=32, H3=2, d_r=32,
-        anchor_chunk=256,
+        anchor_chunk=4096,
+        jet_group_size=16,
+        message_backend="auto",      # dense messages for the dense pilot; sparse for routed/custom anchors
+        ckpt=True,
         dense_matmul=False,
         use_router=False,
         diagnostics=False,
