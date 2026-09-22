@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 
 dependencies = [
-    "torch", "umap-learn", "h5py", "pyarrow"
+    "torch", "umap-learn", "h5py", "pyarrow", "pytest"
 ]
 
 [tool.setuptools.packages.find]
