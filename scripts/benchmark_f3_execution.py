@@ -23,6 +23,13 @@ def main():
     parser.add_argument("--anchor-chunk", type=int, default=4096)
     parser.add_argument("--jet-group-size", type=int, default=16)
     parser.add_argument("--message-backend", choices=("auto", "dense", "sparse"), default="auto")
+    parser.add_argument("--spec", choices=("triangle", "summed_triangle", "tail"), default="triangle")
+    parser.add_argument("--dense-matmul", action="store_true", help="Use the dense summed-triangle contraction")
+    parser.add_argument("--f3-after", type=int, default=4)
+    parser.add_argument("--f3-refresh-after", type=int, nargs="+", default=None,
+                        help="Additional shared F3 computations after these blocks, e.g. 6")
+    parser.add_argument("--f3-inject-blocks", type=int, nargs="+", default=None,
+                        help="Inject both F3 channels only in these blocks, e.g. 5")
     parser.add_argument("--precision", choices=("fp32", "bf16"), default="bf16")
     parser.add_argument("--no-checkpoint", action="store_true")
     parser.add_argument("--warmup", type=int, default=10)
@@ -53,7 +60,9 @@ def main():
         use_pre_activation_pair=True, embed_dims=[128, 512, 128],
         pair_embed_dims=[64, 64, 64], num_heads=8, num_layers=8, num_cls_layers=2,
         fc_params=[(512, 0.1)], activation="gelu", trim=False,
-        f3_after=4, D=32, H3=2, d_r=32, anchor_chunk=args.anchor_chunk,
+        f3_after=args.f3_after, f3_refresh_after=args.f3_refresh_after,
+        f3_inject_blocks=args.f3_inject_blocks, spec=args.spec, dense_matmul=args.dense_matmul,
+        D=32, H3=2, d_r=32, anchor_chunk=args.anchor_chunk,
         jet_group_size=args.jet_group_size, message_backend=args.message_backend,
         ckpt=not args.no_checkpoint,
     ).to(device).train()
@@ -90,6 +99,8 @@ def main():
         raise RuntimeError("Nonfinite loss in benchmark")
     report = {
         "config": vars(args), "torch": torch.__version__,
+        "f3_compute_blocks": list(model.f3_compute_blocks),
+        "f3_inject_blocks": list(model.f3_inject_blocks),
         "device_name": torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU",
         "optimizer": "AdamW", "trim": False, "synthetic_inputs": True,
         "seconds_per_step": elapsed / args.steps,

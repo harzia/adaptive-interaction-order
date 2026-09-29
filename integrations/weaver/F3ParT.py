@@ -108,6 +108,8 @@ def get_model(data_config, **kwargs):
         activation="gelu",
 
         f3_after=4,
+        f3_refresh_after=None,       # extra computation stages, e.g. [6]; shared weights, current nodes
+        f3_inject_blocks=None,       # None = all later blocks; [5] injects both channels only in block 5
         spec="triangle",
         D=32, H3=2, d_r=32,
         anchor_chunk=4096,

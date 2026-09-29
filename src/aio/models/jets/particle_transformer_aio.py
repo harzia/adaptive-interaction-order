@@ -8,6 +8,7 @@ mask convention True = padded inside Block.  Verify with `parity_check` in a pro
 imported this module's model, using identical weights and inputs.
 """
 from __future__ import annotations
+from numbers import Integral
 import torch, torch.nn.functional as F
 
 from aio.core import HigherOrderBlock, Injection, TRIANGLE, SUMMED_TRIANGLE, TAIL, attend_with_message
@@ -100,15 +101,38 @@ class AIOBlock(Block):
 SPECS = {"triangle": TRIANGLE, "summed_triangle": SUMMED_TRIANGLE, "tail": TAIL}
 
 
+def _block_indices(value, name):
+    """Validate 1-based constructor options; reject silent no-op schedules."""
+    if value is None:
+        return ()
+    if isinstance(value, Integral) and not isinstance(value, bool):
+        value = (value,)
+    if not isinstance(value, (tuple, list)) or any(
+            not isinstance(v, Integral) or isinstance(v, bool) for v in value):
+        raise ValueError(f"{name} must be an integer or a list/tuple of integers")
+    result = tuple(int(v) for v in value)
+    if result != tuple(sorted(set(result))):
+        raise ValueError(f"{name} must be strictly increasing, without duplicates")
+    return result
+
+
 class AIOParticleTransformer(ParticleTransformer):
-    """ParT + one higher-order stage: Δr from the output of particle block `f3_after` (1-based), injected
-    into blocks f3_after+1..L.  Particle blocks are converted in place; class blocks untouched.
+    """ParT + configurable F3 computation and injection stages (1-based block indices).
+
+    Defaults preserve the original single stage: compute after `f3_after`, inject into every later
+    particle block. `f3_inject_blocks=[5]` restricts BOTH added bias and vector messages to block 5.
+    `f3_refresh_after=[6]` additionally recomputes F3 after block 6, using the same trainable modules
+    and the current node features. Each refresh REPLACES the cached update; original pair features
+    remain fixed. There is no persistent learned pair-state update or accumulation across stages.
+    Calibration is performed once, at the first computation stage, for the shared F3 module.
+    Particle blocks are converted in place; class blocks untouched.
 
     Only `_forward_encoder` is overridden, so the inherited `forward` and any embed-export path that calls
     `_forward_encoder` + `_forward_aggregator` both go through the stage.  Runtime knobs are attributes
     (set them on the module; the Weaver wrapper's forward signature is unchanged):
         use_f3 (True)   rho (None = dense)   anc / gate / cand_mask (None)   — see spec §2.6, §3.1, §5.
-        record_last (False): keep branch outputs in `self.last` (use under no_grad; see __init__).
+        record_last (False): keep the latest branch output in `self.last`, and all stage outputs in
+            `self.last_stages` keyed by the computation block (use under no_grad to avoid graph retention).
         require_calibration (True): first training forward raises if the stage was never calibrated.
         message_backend ("auto"): dense messages for the dense pilot, sparse for routed/custom anchors;
             "dense" and "sparse" force either path. Dense pair updates are built once per stage.
@@ -116,7 +140,8 @@ class AIOParticleTransformer(ParticleTransformer):
     `spec` may be a tuple of PoolSpec or one of the names in SPECS (Weaver -o options are strings)."""
 
     def __init__(self, *a, f3_after=4, spec="triangle", D=32, H3=2, d_r=32, anchor_chunk=4096, dense_matmul=False,
-                 use_router=False, diagnostics=False, jet_group_size=16, message_backend="auto", ckpt=True, **kw):
+                 use_router=False, diagnostics=False, jet_group_size=16, message_backend="auto", ckpt=True,
+                 f3_refresh_after=None, f3_inject_blocks=None, **kw):
         if message_backend not in ("auto", "dense", "sparse"):
             raise ValueError("message_backend must be 'auto', 'dense', or 'sparse'")
         super().__init__(*a, **kw)
@@ -124,7 +149,25 @@ class AIOParticleTransformer(ParticleTransformer):
         assert all(self.block_ids_with_attn_mask), "AIO adapter passes the pair bias to every particle block"
         spec = SPECS[spec] if isinstance(spec, str) else spec
         d, H = self.blocks[0].embed_dim, self.blocks[0].num_heads
-        self.f3_after = f3_after
+        if not isinstance(f3_after, Integral) or isinstance(f3_after, bool):
+            raise ValueError("f3_after must be one integer; use f3_refresh_after for additional stages")
+        self.f3_after = int(f3_after)
+        self.f3_refresh_after = _block_indices(f3_refresh_after, "f3_refresh_after")
+        self.f3_compute_blocks = (self.f3_after,) + self.f3_refresh_after
+        L = len(self.blocks)
+        if any(b < 1 or b >= L for b in self.f3_compute_blocks):
+            raise ValueError(f"F3 computation blocks must lie between 1 and {L - 1}")
+        if self.f3_compute_blocks != tuple(sorted(set(self.f3_compute_blocks))):
+            raise ValueError("f3_refresh_after must contain strictly increasing blocks after f3_after")
+        self.f3_inject_blocks = (tuple(range(self.f3_after + 1, L + 1)) if f3_inject_blocks is None
+                                 else _block_indices(f3_inject_blocks, "f3_inject_blocks"))
+        if not self.f3_inject_blocks or any(b <= self.f3_after or b > L for b in self.f3_inject_blocks):
+            raise ValueError(f"f3_inject_blocks must be nonempty and lie between {self.f3_after + 1} and {L}")
+        for start, end in zip(self.f3_compute_blocks, self.f3_compute_blocks[1:] + (L,)):
+            if not any(start < b <= end for b in self.f3_inject_blocks):
+                raise ValueError(f"F3 computation after block {start} is never injected before the next stage/end")
+        self._f3_compute_set = frozenset(self.f3_compute_blocks)
+        self._f3_inject_set = frozenset(self.f3_inject_blocks)
         self.message_backend = message_backend
         with torch.random.fork_rng(devices=[]):
             tap = PairEmbedTap.convert(self.pair_embed, d_b=16)
@@ -135,7 +178,7 @@ class AIOParticleTransformer(ParticleTransformer):
         for blk in self.blocks:
             blk.__class__, blk.attn.__class__ = AIOBlock, AIOAttention
         self.use_f3, self.rho, self.anc, self.gate, self.cand_mask = True, None, None, None, None
-        self.record_last, self.last = False, None
+        self.record_last, self.last, self.last_stages = False, None, None
         self.require_calibration, self._calibration_checked = True, False
 
     def load_baseline(self, state_dict):
@@ -163,17 +206,27 @@ class AIOParticleTransformer(ParticleTransformer):
                 raise RuntimeError("F3 stage is uncalibrated in a training forward: run calibrate() before the first "
                                    "optimizer step (spec §2.2), or set model.require_calibration=False on purpose.")
             self._calibration_checked = True
-        x, padding_mask, e_pair, attn_mask = self._prelude(x, v, mask, uu, uu_idx)
+        x, padding_mask, e_pair, base_attn_mask = self._prelude(x, v, mask, uu, uu_idx)
+        injected_attn_mask = base_attn_mask
         msg_fn, self.last = None, None
+        self.last_stages = {} if self.record_last else None
         for li, block in enumerate(self.blocks):
-            x = block(x, padding_mask=padding_mask, attn_mask=attn_mask, msg_fn=msg_fn)
-            if self.use_f3 and li + 1 == self.f3_after:                       # AIO: Δr from this block's output
+            block_id = li + 1
+            inject = self.use_f3 and block_id in self._f3_inject_set
+            x = block(x, padding_mask=padding_mask,
+                      attn_mask=injected_attn_mask if inject else base_attn_mask,
+                      msg_fn=msg_fn if inject else None)
+            if self.use_f3 and block_id in self._f3_compute_set:             # read CURRENT node features
                 B, N = padding_mask.shape
                 delta_a, anc_sel, aux = self.hob(x, e_pair, ~padding_mask, self.rho, self.anc, self.gate, self.cand_mask)
                 if self.record_last:                                          # Fix 3: opt-in, see __init__
                     self.last = {"delta_a": delta_a, "anc": anc_sel, **aux}
+                    self.last_stages[block_id] = self.last
+                # Replace the previous stage, including on an empty selection. Never add a new
+                # correction to the old F3 bias, and never carry a stale message through a refresh.
+                injected_attn_mask, msg_fn = base_attn_mask, None
                 if anc_sel.shape[0]:                                          # zero-selection: host untouched
-                    attn_mask = attn_mask + self.inj.bias(delta_a, anc_sel, B, N)
+                    injected_attn_mask = base_attn_mask + self.inj.bias(delta_a, anc_sel, B, N)
                     dense = self.message_backend == "dense" or (
                         self.message_backend == "auto" and self.anc is None and
                         (self.rho is None or self.rho >= 1))
