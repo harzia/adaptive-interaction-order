@@ -1,0 +1,5 @@
+# Install an appropriate CPU/CUDA PyTorch build first.
+torch>=2.4
+weaver-core>=0.5.3
+pytest>=8
+# No lloca / torch-geometric dependency is needed for this independent pilot.
