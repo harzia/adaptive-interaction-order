@@ -93,16 +93,17 @@ Kinematics-only YAML and `(px,py,pz,E)` input order are unchanged.
 export DATA_PATH=/path/to/data
 export OUTPUT_PATH=/path/to/outputs
 export SEED=123
+export COMMENT=my-region-run  # Choose a distinct name for each run.
 
 # Prints the command without starting a job or requiring data:
-AIO_DRY_RUN=1 bash scripts/run_representation_experiment.sh regions8_rank2
+AIO_DRY_RUN=1 COMMENT=regions8_rank2-run bash scripts/run_representation_experiment.sh regions8_rank2
 
-bash scripts/run_representation_experiment.sh full_sv
-bash scripts/run_representation_experiment.sh regions16_sv
-bash scripts/run_representation_experiment.sh regions8_sv
-bash scripts/run_representation_experiment.sh regions16_rank2
-bash scripts/run_representation_experiment.sh regions8_rank2
-bash scripts/run_representation_experiment.sh regions8_wide
+COMMENT=full_sv-run bash scripts/run_representation_experiment.sh full_sv
+COMMENT=regions16_sv-run bash scripts/run_representation_experiment.sh regions16_sv
+COMMENT=regions8_sv-run bash scripts/run_representation_experiment.sh regions8_sv
+COMMENT=regions16_rank2-run bash scripts/run_representation_experiment.sh regions16_rank2
+COMMENT=regions8_rank2-run bash scripts/run_representation_experiment.sh regions8_rank2
+COMMENT=regions8_wide-run bash scripts/run_representation_experiment.sh regions8_wide
 ```
 
 Each command launches one run, retaining the base script's train-then-test behavior.
@@ -127,10 +128,10 @@ All other arguments pass through unchanged to the base launcher / Weaver, includ
 and `--test-only --weights PATH`. Weaver validates its own options. Model and data
 overrides are allowed, but change the preset comparison.
 
-The default run name includes preset, learned/frozen geometry, percentage, seed and
-epochs, e.g. `regions8_rank2-learned-25pct-seed42-epochs30`.
-Use `AIO_RUN_COMMENT` for a custom name and to distinguish other overrides such as
-learning rate or model options. For a short actual-data check:
+Set `COMMENT` yourself (export it or prefix the command with `COMMENT=your-run-name`).
+The wrapper passes it through unchanged and does not generate a name or use
+`AIO_RUN_COMMENT`. The base launcher requires a nonempty `COMMENT` for actual runs.
+Choose distinct comments for runs you want to keep separate. For a short actual-data check:
 
 ```bash
 bash scripts/run_representation_experiment.sh regions8_rank2 \
@@ -150,18 +151,18 @@ Train `regions8_sv`, then export its grouping AND frame predictor:
 ```bash
 python scripts/export_region_geometry.py \
   --preset regions8_sv \
-  --checkpoint "$OUTPUT_PATH/RegionLLoCa/JetClass2_kin/regions8_sv-learned-10pct-seed123-epochs80/training/net_best_epoch_state.pt" \
+  --checkpoint "$OUTPUT_PATH/RegionLLoCa/JetClass2_kin/regions8_sv-run/training/net_best_epoch_state.pt" \
   --output learned_geometry_k8.pt
 
 export GEOMETRY_CHECKPOINT="$PWD/learned_geometry_k8.pt"
-bash scripts/run_representation_experiment.sh regions8_sv
-bash scripts/run_representation_experiment.sh regions8_rank2
-bash scripts/run_representation_experiment.sh regions8_wide
+COMMENT=regions8_sv-frozen bash scripts/run_representation_experiment.sh regions8_sv
+COMMENT=regions8_rank2-frozen bash scripts/run_representation_experiment.sh regions8_rank2
+COMMENT=regions8_wide-frozen bash scripts/run_representation_experiment.sh regions8_wide
 unset GEOMETRY_CHECKPOINT
 ```
 
 These reruns train fresh backbones with exactly the same frozen input-to-region
-mapping and frames. The `frozen` suffix distinguishes their output directories.
+mapping and frames. The explicitly supplied comments distinguish their output directories.
 K=16 requires its corresponding checkpoint; incompatible specifications are rejected.
 SV-trained geometry can favor SV: report provenance and keep joint training separate.
 This stronger comparison needs additional runs beyond the first six configurations.
