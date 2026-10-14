@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
-# Initial learned-region experiments; full protocol matches run_triplet_experiment.sh.
+# Learned-region presets with configurable training and Weaver argument passthrough.
 set -euo pipefail
 usage() {
     cat <<'USAGE'
-Usage: bash scripts/run_representation_experiment.sh PRESET [Weaver logging arguments...]
+Usage: bash scripts/run_representation_experiment.sh PRESET [training options] [Weaver arguments...]
 Presets: full_sv, regions16_sv, regions8_sv, regions16_rank2, regions8_rank2,
          regions8_wide (optional: regions16_wide).
-Environment: DATA_PATH, OUTPUT_PATH, SEED (123), DDP_NGPUS, BATCH_SIZE.
-EPOCHS must be 80. Protocol is 10% JetClass-II, kinematics only, from scratch.
+Training options: --num-epochs N, --seed N, --train-percentage N (integer 1-100).
+Both --option VALUE and --option=VALUE are accepted for these options.
+Defaults: EPOCHS=80, SEED=123, TRAIN_PERCENTAGE=10; command-line values win.
+Other arguments pass through to Weaver via run_jetclass2.sh, including -o options,
+batch size, learning rate, resume and test-only options. Presets default to kin data.
+Environment: DATA_PATH, OUTPUT_PATH, DDP_NGPUS, BATCH_SIZE, NUM_WORKERS.
 AIO_DRY_RUN=1 prints the launch without accessing data or creating output directories.
-AIO_RUN_COMMENT overrides the preset/seed name.
+AIO_RUN_COMMENT overrides the preset/percentage/seed/epochs run name.
 GEOMETRY_CHECKPOINT optionally loads exported learned geometry and freezes it.
-For a short smoke run or test-only evaluation, use run_jetclass2.sh RegionLLoCa directly.
+Model/data overrides are allowed; use a distinct AIO_RUN_COMMENT for custom variants.
 USAGE
 }
 if [[ $# -eq 0 || "${1:-}" == --help || "${1:-}" == -h ]]; then usage; exit 0; fi
@@ -20,19 +24,40 @@ case "$preset" in
     full_sv|regions16_sv|regions8_sv|regions16_rank2|regions8_rank2|regions8_wide|regions16_wide) ;;
     *) echo "Unknown preset: $preset" >&2; exit 2 ;;
 esac
-if [[ "${EPOCHS:-80}" != 80 ]]; then
-    echo "Comparison presets require EPOCHS=80; use the base launcher for smoke runs." >&2; exit 2
-fi
-for arg in "$@"; do
-    case "$arg" in
-        -o|--network-option|--network-option=*|--network-config|--network-config=*|--data-config|--data-config=*|--num-epochs|--num-epochs=*|--train-percentage|--train-percentage=*|--seed|--seed=*|--weights|--weights=*|--test-only|--load-model-weights|--load-model-weights=*|--load-epoch|--load-epoch=*)
-            echo "Do not override preset model/data/training options: $arg" >&2; exit 2 ;;
+epochs=${EPOCHS:-80}
+seed=${SEED:-123}
+train_percentage=${TRAIN_PERCENTAGE:-10}
+extra_args=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --num-epochs|--seed|--train-percentage)
+            if [[ $# -lt 2 || "$2" == --* ]]; then
+                echo "Missing value for $1" >&2; exit 2
+            fi
+            option=$1; value=$2; shift 2 ;;
+        --num-epochs=*|--seed=*|--train-percentage=*)
+            option=${1%%=*}; value=${1#*=}; shift ;;
+        *)
+            extra_args+=("$1"); shift; continue ;;
+    esac
+    case "$option" in
+        --num-epochs) epochs=$value ;;
+        --seed) seed=$value ;;
+        --train-percentage) train_percentage=$value ;;
     esac
 done
+if ! [[ "$epochs" =~ ^[1-9][0-9]*$ ]]; then
+    echo "--num-epochs / EPOCHS must be a positive integer." >&2; exit 2
+fi
+if ! [[ "$seed" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    echo "--seed / SEED must be a nonnegative integer." >&2; exit 2
+fi
+if ! [[ "$train_percentage" =~ ^([1-9]|[1-9][0-9]|100)$ ]]; then
+    echo "--train-percentage / TRAIN_PERCENTAGE must be an integer from 1 to 100." >&2; exit 2
+fi
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "${script_dir}/.." && pwd)
-seed=${SEED:-123}
-export EPOCHS=80
+export EPOCHS="$epochs"
 suffix=learned
 geometry_args=()
 if [[ -n "${GEOMETRY_CHECKPOINT:-}" ]]; then
@@ -43,10 +68,10 @@ if [[ -n "${GEOMETRY_CHECKPOINT:-}" ]]; then
     geometry_literal=$(python -c 'import json, os; print(json.dumps(os.path.abspath(os.environ["GEOMETRY_CHECKPOINT"])))')
     geometry_args=(-o geometry_checkpoint "$geometry_literal" -o freeze_geometry True)
 fi
-export COMMENT=${AIO_RUN_COMMENT:-${preset}-${suffix}-10pct-seed${seed}}
+export COMMENT=${AIO_RUN_COMMENT:-${preset}-${suffix}-${train_percentage}pct-seed${seed}-epochs${epochs}}
 export PYTHONPATH="${repo_root}/src:${repo_root}${PYTHONPATH:+:${PYTHONPATH}}"
-cmd=(bash "${script_dir}/run_jetclass2.sh" RegionLLoCa kin --train-percentage 10 --seed "$seed"
-     -o preset "'$preset'" "${geometry_args[@]}" "$@")
+cmd=(bash "${script_dir}/run_jetclass2.sh" RegionLLoCa kin --train-percentage "$train_percentage" --seed "$seed"
+     -o preset "'$preset'" "${geometry_args[@]}" "${extra_args[@]}")
 if [[ "${AIO_DRY_RUN:-0}" == 1 ]]; then
     printf 'EPOCHS=%q COMMENT=%q ' "$EPOCHS" "$COMMENT"
     printf '%q ' "${cmd[@]}"; printf '\n'; exit 0
