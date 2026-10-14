@@ -84,8 +84,9 @@ because replica-local auxiliary losses would not be collected correctly.
 
 ## Launch the first runs
 
-The data paths, 188 labels, splits, reweighting, optimizer, learning rate, 80 epochs
-and 10% protocol come from `run_jetclass2.sh`, as in the triplet experiments.
+The data paths, 188 labels, splits, reweighting, optimizer and learning rate come
+from `run_jetclass2.sh`, as in the triplet experiments. The experiment wrapper defaults
+to 80 epochs, seed 123 and 10% training data; these are configurable defaults.
 Kinematics-only YAML and `(px,py,pz,E)` input order are unchanged.
 
 ```bash
@@ -105,13 +106,38 @@ bash scripts/run_representation_experiment.sh regions8_wide
 ```
 
 Each command launches one run, retaining the base script's train-then-test behavior.
-Repeat the important comparisons across seeds. The fixed launcher rejects model/data/
-epoch overrides. For short actual-data checks, use the base launcher:
+Repeat the important comparisons across seeds. For example:
 
 ```bash
-EPOCHS=1 COMMENT=region-smoke bash scripts/run_jetclass2.sh RegionLLoCa kin \
-  --train-percentage 1 --seed 123 -o preset "'regions8_rank2'"
+bash scripts/run_representation_experiment.sh regions8_rank2 \
+  --num-epochs 30 --seed 42 --train-percentage 25 \
+  --batch-size 256 --start-lr 1e-4
 ```
+
+The three training options accept both `--option VALUE` and `--option=VALUE`.
+Environment defaults `EPOCHS`, `SEED` and `TRAIN_PERCENTAGE` are also supported;
+command-line options take precedence. Training percentage is an integer from 1 to 100.
+The base launcher selects the first ceil(percentage * file_count / 100) training
+files in each category and scales the samples-per-epoch budget. It does not randomly
+select that exact fraction of events. Validation and test file lists stay unchanged;
+the seed does not change the selected file subset.
+
+All other arguments pass through unchanged to the base launcher / Weaver, including
+`--batch-size`, `--start-lr`, `--num-workers`, `-o NAME VALUE`, resume options,
+and `--test-only --weights PATH`. Weaver validates its own options. Model and data
+overrides are allowed, but change the preset comparison.
+
+The default run name includes preset, learned/frozen geometry, percentage, seed and
+epochs, e.g. `regions8_rank2-learned-25pct-seed42-epochs30`.
+Use `AIO_RUN_COMMENT` for a custom name and to distinguish other overrides such as
+learning rate or model options. For a short actual-data check:
+
+```bash
+bash scripts/run_representation_experiment.sh regions8_rank2 \
+  --num-epochs 1 --train-percentage 1 --seed 123
+```
+
+Use `AIO_DRY_RUN=1` with any of these commands to inspect the resolved options.
 
 These first commands compare **jointly learned** grouping and representation. Their
 groups can diverge during training even with identical seeds. For an isolated order
@@ -124,7 +150,7 @@ Train `regions8_sv`, then export its grouping AND frame predictor:
 ```bash
 python scripts/export_region_geometry.py \
   --preset regions8_sv \
-  --checkpoint "$OUTPUT_PATH/RegionLLoCa/JetClass2_kin/regions8_sv-learned-10pct-seed123/training/net_best_epoch_state.pt" \
+  --checkpoint "$OUTPUT_PATH/RegionLLoCa/JetClass2_kin/regions8_sv-learned-10pct-seed123-epochs80/training/net_best_epoch_state.pt" \
   --output learned_geometry_k8.pt
 
 export GEOMETRY_CHECKPOINT="$PWD/learned_geometry_k8.pt"
