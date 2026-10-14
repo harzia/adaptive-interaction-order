@@ -1,0 +1,17 @@
+{
+  "hidden_dim": 64,
+  "num_heads": 4,
+  "num_layers": 4,
+  "ffn_dim": 128,
+  "scalars": 8,
+  "vectors": 2,
+  "tensors": 0,
+  "local_neighbors": 8,
+  "geometry_dim": 32,
+  "dropout": 0.0,
+  "assignment_temperature": 0.5,
+  "balance_weight": 0.01,
+  "entropy_weight": 0.001,
+  "locality_weight": 0.01,
+  "fc_params": [[512, 0.1]]
+}

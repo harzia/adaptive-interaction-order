@@ -1,0 +1,1 @@
+{"description": "8 learned regions, one additional general rank-2 Q/K/V channel per head", "model": {"num_regions": 8, "tensors": 1}}
