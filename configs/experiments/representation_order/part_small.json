@@ -1,0 +1,19 @@
+{
+  "family": "part",
+  "description": "Small original ParT: width 48, 4 encoder blocks, original pair embedding and 2 class blocks",
+  "model": {
+    "pair_input_dim": 4,
+    "use_pre_activation_pair": true,
+    "embed_dims": [48, 192, 48],
+    "pair_embed_dims": [64, 64, 64],
+    "num_heads": 4,
+    "num_layers": 4,
+    "num_cls_layers": 2,
+    "block_params": null,
+    "cls_block_params": {"dropout": 0, "attn_dropout": 0, "activation_dropout": 0},
+    "fc_params": [[512, 0.1]],
+    "activation": "gelu",
+    "trim": true,
+    "for_inference": false
+  }
+}

@@ -1,0 +1,4 @@
+{
+  "description": "Full SV plus two ParT class-attention blocks; no pair bias",
+  "model": {"num_regions": 0, "readout": "class_attention"}
+}

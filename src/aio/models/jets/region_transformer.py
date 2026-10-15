@@ -1,8 +1,8 @@
 """Learned-region representation-order pilot, using LLoCa-style attention.
 
-This is an independent small backbone. It does NOT reproduce official LLoCa-ParT:
-there is no ParT pair bias, class attention, or published Frames-Net checkpoint.
-All experimental arms share this implementation and a scalar mean readout.
+This is an independent small backbone, not official LLoCa-ParT. Original presets
+use no pair bias and mean readout. Optional reference ablations add a local-frame
+pair-feature MLP and/or the repository's ParT class-attention readout.
 """
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import torch
 from torch import nn
 from aio.core.geometry.attention import GeometricAttention
 from aio.core.geometry.regions import LearnedRegionGeometry
+from aio.core.geometry.pair_bias import LocalFramePairBias
 
 
 class RegionBlock(nn.Module):
@@ -27,14 +28,14 @@ class RegionBlock(nn.Module):
                                  nn.Dropout(dropout), nn.Linear(ffn_dim, hidden_dim))
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, h, geometry, mask, tensor_gate=None):
+    def forward(self, h, geometry, mask, tensor_gate=None, pair_bias=None):
         args = (geometry["frames"], geometry["frame_valid"], mask)
         h = h + self.dropout(self.local_attention(
             self.local_norm(h), *args, indices=geometry["indices"],
-            neighbor_mask=geometry["neighbor_mask"]))
+            neighbor_mask=geometry["neighbor_mask"], pair_bias=pair_bias))
         regional = dict(assignments=geometry["assignments"], mass=geometry["mass"],
                         region_mask=geometry["region_mask"], tensor_gate=tensor_gate) if self.coarse else {}
-        h = h + self.dropout(self.global_attention(self.global_norm(h), *args, **regional))
+        h = h + self.dropout(self.global_attention(self.global_norm(h), *args, pair_bias=pair_bias, **regional))
         h = h + self.dropout(self.ffn(self.ffn_norm(h)))
         return h * mask[..., None]
 
@@ -45,12 +46,19 @@ class RegionTransformer(nn.Module):
                  tensors=0, local_neighbors=8, geometry_dim=32, dropout=0.,
                  assignment_temperature=0.5, balance_weight=0.01,
                  entropy_weight=0.001, locality_weight=0.01,
-                 fc_params=(), for_inference=False):
+                 fc_params=(), for_inference=False, pair_bias=False, pair_bias_dim=32,
+                 readout="mean", readout_layers=2):
         super().__init__()
         if num_classes < 2 or input_dim < 0 or num_layers < 1:
             raise ValueError("Invalid input_dim, num_classes, or num_layers")
         if min(hidden_dim, num_heads, ffn_dim, geometry_dim, local_neighbors) < 1:
             raise ValueError("Hidden sizes and neighborhood/head counts must be positive")
+        if pair_bias and num_regions:
+            raise ValueError("Pair-bias ablations currently require full particle attention (num_regions=0)")
+        if readout not in ("mean", "class_attention"):
+            raise ValueError("readout must be mean or class_attention")
+        if readout == "class_attention" and (readout_layers < 1 or hidden_dim % num_heads):
+            raise ValueError("Class attention requires positive layers and hidden_dim divisible by num_heads")
         self.input_dim = input_dim
         self.num_regions = num_regions
         self.for_inference = for_inference
@@ -68,6 +76,20 @@ class RegionTransformer(nn.Module):
             head += [nn.Linear(width, units), nn.GELU(), nn.Dropout(probability)]
             width = units
         self.head = nn.Sequential(*head, nn.Linear(width, num_classes))
+        # Create optional modules after the original ones so old presets and
+        # their initialization/state_dict remain unchanged under a fixed seed.
+        self.pair_bias = LocalFramePairBias(num_heads, pair_bias_dim) if pair_bias else None
+        self.readout = readout
+        self.cls_token = None
+        self.cls_blocks = None
+        if readout == "class_attention":
+            from aio.models.jets.particle_transformer import Block
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+            nn.init.trunc_normal_(self.cls_token, std=0.02)
+            self.cls_blocks = nn.ModuleList([
+                Block(embed_dim=hidden_dim, num_heads=num_heads, ffn_ratio=4,
+                      dropout=0., attn_dropout=0., activation_dropout=0.)
+                for _ in range(readout_layers)])
         self.geometry_frozen = False
         self.last_aux_loss = None
         self.last_diagnostics = {}
@@ -117,9 +139,17 @@ class RegionTransformer(nn.Module):
             local_p = local_p * geometry["frame_valid"][..., None]
             local_p = local_p.sign() * local_p.abs().log1p()
         h = self.embed(torch.cat((x, local_p), -1)) * valid[..., None]
+        bias = (self.pair_bias(p, geometry["frames"], geometry["frame_valid"], valid)
+                if self.pair_bias is not None else None)
         for block in self.blocks:
-            h = block(h, geometry, valid, tensor_gate=tensor_gate)
-        embedding = (self.norm(h) * valid[..., None]).sum(1) / valid.sum(1, keepdim=True)
+            h = block(h, geometry, valid, tensor_gate=tensor_gate, pair_bias=bias)
+        if self.cls_blocks is None:
+            embedding = (self.norm(h) * valid[..., None]).sum(1) / valid.sum(1, keepdim=True)
+        else:
+            cls = self.cls_token.expand(batch, -1, -1)
+            for block in self.cls_blocks:
+                cls = block(h, x_cls=cls, padding_mask=~valid)
+            embedding = self.norm(cls[:, 0])
         return embedding, geometry
 
     def forward(self, features, v, mask, *, references=None, tensor_gate=None, return_aux=False):

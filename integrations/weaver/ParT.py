@@ -68,6 +68,7 @@ class ParticleTransformerWrapper(torch.nn.Module):
 
 
 def get_model(data_config, **kwargs):
+    preset = kwargs.pop("preset", None)
     cfg = dict(
         input_dim=len(
             data_config.input_dicts["pf_features"]
@@ -99,6 +100,11 @@ def get_model(data_config, **kwargs):
     # Weaver network options, e.g.
     #   -o num_classes 188
     #   -o fc_params "[(512,0.1)]"
+    if preset is not None:
+        from aio.models.jets.representation_experiments import experiment_config, experiment_family
+        if experiment_family(preset) != "part":
+            raise ValueError("ParT requires a ParT-family preset")
+        cfg.update(experiment_config(preset))
     cfg.update(**kwargs)
 
     if cfg["num_classes"] is None:

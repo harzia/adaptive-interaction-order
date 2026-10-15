@@ -6,7 +6,7 @@ from weaver.utils.logger import _logger
 from weaver.utils.nn.tools import train_classification
 from integrations.weaver.ParT import evaluate_classification_lean
 from aio.models.jets.region_transformer import RegionTransformer
-from aio.models.jets.representation_experiments import experiment_config
+from aio.models.jets.representation_experiments import experiment_config, experiment_family
 
 
 class RegionTransformerWrapper(torch.nn.Module):
@@ -25,12 +25,18 @@ class RegionTransformerWrapper(torch.nn.Module):
             output = output.softmax(-1)
         return torch.cat((output, embedding), -1)
 
+    @torch.jit.ignore
+    def no_weight_decay(self):
+        return {"mod.cls_token"} if self.mod.cls_token is not None else set()
+
 
 def get_model(data_config, **kwargs):
     # Weaver injects these flags; autocast/compilation are managed by its outer loop.
     kwargs.pop("use_amp", None)
     kwargs.pop("compile_model", None)
     preset = kwargs.pop("preset", "full_sv")
+    if experiment_family(preset) != "region":
+        raise ValueError("RegionLLoCa requires a region-family preset")
     geometry_checkpoint = kwargs.pop("geometry_checkpoint", None)
     freeze_geometry = kwargs.pop("freeze_geometry", bool(geometry_checkpoint))
     export_embed = kwargs.pop("export_embed", False)

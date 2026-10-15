@@ -2,13 +2,14 @@
 
 This adds an **independent small LLoCa-style pilot backbone** with the existing
 `src/aio`, Weaver adapter, dataset config, launcher and evaluation layout.
-Existing ParT and F3 code is unchanged.
+Existing ParT and F3 defaults are unchanged. ParT additionally accepts an optional
+small-model preset; see [baseline controls and diagnostics](representation_controls.md).
 
 It is **not** a reproduction of published LLoCa-ParT or its reported accuracy.
-The new model omits ParT pair biases and class attention, uses a smaller locally
-conditioned frame predictor, and uses a masked mean readout. The full-attention
-arm is the reference for THIS family. All arms share depth, hidden width, local
-branch and readout.
+The original presets omit ParT pair biases and class attention, use a smaller locally
+conditioned frame predictor, and use a masked mean readout. The full-attention
+arm is the reference for THIS family. The original order/granularity arms share
+depth, hidden width, local branch and readout.
 
 ## Operator
 
