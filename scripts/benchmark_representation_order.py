@@ -11,8 +11,7 @@ import platform
 import time
 from pathlib import Path
 import torch
-from aio.models.jets.region_transformer import RegionTransformer
-from aio.models.jets.representation_experiments import experiment_config
+from aio.models.jets.representation_experiments import experiment_config, experiment_family, build_experiment
 
 
 def synthetic_batch(batch_size, particles, input_dim=7, device="cpu"):
@@ -52,14 +51,18 @@ def main():
     for preset in args.presets:
         torch.manual_seed(123)
         config = experiment_config(preset)
-        model = RegionTransformer(7, 188, **config).to(device)
+        family = experiment_family(preset)
+        # Fixed N for comparable shape timing: training-time random ParT trimming
+        # is disabled here only. Real training keeps the original preset behavior.
+        model = build_experiment(preset, **({"trim": False} if family == "part" else {})).to(device)
         model.train(args.backward)
 
         def step():
             with torch.set_grad_enabled(args.backward):
                 with torch.autocast(device.type, dtype=torch.bfloat16, enabled=args.amp):
                     logits = model(*inputs)
-                    loss = torch.nn.functional.cross_entropy(logits, labels) + model.last_aux_loss
+                    if args.backward:
+                        loss = torch.nn.functional.cross_entropy(logits, labels) + getattr(model, "last_aux_loss", 0.)
                 if args.backward:
                     loss.backward()
                     model.zero_grad(set_to_none=True)
@@ -81,8 +84,10 @@ def main():
         row = dict(preset=preset, parameters=sum(p.numel() for p in model.parameters()),
                    milliseconds_per_batch=seconds * 1000, jets_per_second=args.batch_size / seconds,
                    peak_allocated_bytes=torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None,
-                   message_components_per_head=config["scalars"] + 4 * config["vectors"] + 16 * config["tensors"],
-                   diagnostics={k: float(v) for k, v in model.last_diagnostics.items()})
+                   family=family,
+                   message_components_per_head=(config["scalars"] + 4 * config["vectors"] + 16 * config["tensors"]
+                                                if family == "region" else config["embed_dims"][-1] // config["num_heads"]),
+                   diagnostics={k: float(v) for k, v in getattr(model, "last_diagnostics", {}).items()})
         rows.append(row)
         print(json.dumps(row), flush=True)
         del model

@@ -1,0 +1,4 @@
+{
+  "description": "Optional combined pair-bias and class-readout reference",
+  "model": {"num_regions": 0, "pair_bias": true, "readout": "class_attention"}
+}

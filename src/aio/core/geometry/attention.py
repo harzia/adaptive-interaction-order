@@ -44,7 +44,7 @@ class GeometricAttention(nn.Module):
 
     def forward(self, h, frames, frame_valid, mask, *, assignments=None,
                 mass=None, region_mask=None, indices=None, neighbor_mask=None,
-                tensor_gate=None):
+                tensor_gate=None, pair_bias=None):
         shape = (*h.shape[:2], 3, self.num_heads, self.head_dim)
         q_local, k_local, v_local = self.qkv(h).reshape(shape).unbind(2)
         dtype = torch.float64 if frames.dtype == torch.float64 else torch.float32
@@ -53,6 +53,8 @@ class GeometricAttention(nn.Module):
             q, k, v = [self.transport(x.to(dtype), matrices, frame_valid)
                        for x in (q_local, k_local, v_local)]
             if assignments is not None:
+                if pair_bias is not None:
+                    raise ValueError("Regional pair bias needs an explicit coarse-token definition")
                 if indices is not None:
                     raise ValueError("Regional and neighbor modes are mutually exclusive")
                 a = assignments.to(dtype)
@@ -72,6 +74,10 @@ class GeometricAttention(nn.Module):
 
             if indices is None:
                 logits = torch.einsum("bihd,bjhd->bhij", q * self.metric, k) / math.sqrt(self.head_dim)
+                if pair_bias is not None:
+                    if pair_bias.shape != logits.shape:
+                        raise ValueError("pair_bias must have shape [B,H,N,N]")
+                    logits = logits + pair_bias.to(dtype)
                 if assignments is not None:
                     logits = logits + mass.to(dtype).clamp_min(1e-8).log()[:, None, None, :]
                 logits = logits.masked_fill(~key_mask[:, None, None, :], -torch.finfo(dtype).max)
@@ -81,6 +87,12 @@ class GeometricAttention(nn.Module):
             else:
                 keys, values = gather_tokens(k, indices), gather_tokens(v, indices)
                 logits = ((q * self.metric)[:, :, None] * keys).sum(-1) / math.sqrt(self.head_dim)
+                if pair_bias is not None:
+                    expected = (h.shape[0], self.num_heads, h.shape[1], h.shape[1])
+                    if pair_bias.shape != expected:
+                        raise ValueError("pair_bias must have shape [B,H,N,N]")
+                    local_bias = pair_bias.gather(3, indices[:, None].expand(-1, self.num_heads, -1, -1))
+                    logits = logits + local_bias.permute(0, 2, 3, 1).to(dtype)
                 logits = logits.masked_fill(~neighbor_mask[..., None], -torch.finfo(dtype).max)
                 weight = logits.softmax(2) * neighbor_mask[..., None]
                 weight = weight / weight.sum(2, keepdim=True).clamp_min(1e-8)
