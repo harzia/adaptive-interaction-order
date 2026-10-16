@@ -1,0 +1,8 @@
+{
+  "description": "16 learned regions, sv messages; sparse local pair bias, no regional pair bias",
+  "model": {
+    "num_regions": 16,
+    "pair_bias": true,
+    "pair_bias_scope": "local"
+  }
+}

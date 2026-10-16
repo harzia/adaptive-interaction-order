@@ -85,6 +85,8 @@ def main():
                    milliseconds_per_batch=seconds * 1000, jets_per_second=args.batch_size / seconds,
                    peak_allocated_bytes=torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None,
                    family=family,
+                   region_source=config.get("region_source", "learned") if family == "region" else None,
+                   includes_cpu_ca_clustering=config.get("region_source") == "ca",
                    message_components_per_head=(config["scalars"] + 4 * config["vectors"] + 16 * config["tensors"]
                                                 if family == "region" else config["embed_dims"][-1] // config["num_heads"]),
                    diagnostics={k: float(v) for k, v in getattr(model, "last_diagnostics", {}).items()})

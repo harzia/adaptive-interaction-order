@@ -7,6 +7,10 @@ Usage: bash scripts/run_representation_experiment.sh PRESET [training options] [
 Presets: full_sv, regions16_sv, regions8_sv, regions16_rank2, regions8_rank2,
          regions8_wide, regions16_wide; reference controls: part_small,
          full_sv_pair, full_sv_cls, full_sv_pair_cls.
+Follow-ups: full_sv_pair_local, full_sv_pair_global;
+           regions{8,16}_ca_{sv,rank2,wide};
+           regions{8,16}_{sv,rank2,wide}_pair_local;
+           regions{8,16}_ca_{sv,rank2,wide}_pair_local.
 Training options: --num-epochs N, --seed N, --train-percentage N (integer 1-100).
 Both --option VALUE and --option=VALUE are accepted for these options.
 Defaults: EPOCHS=80, SEED=123, TRAIN_PERCENTAGE=10; command-line values win.
@@ -23,6 +27,9 @@ if [[ $# -eq 0 || "${1:-}" == --help || "${1:-}" == -h ]]; then usage; exit 0; f
 preset=$1; shift
 case "$preset" in
     full_sv|full_sv_pair|full_sv_cls|full_sv_pair_cls|part_small|regions16_sv|regions8_sv|regions16_rank2|regions8_rank2|regions8_wide|regions16_wide) ;;
+    full_sv_pair_local|full_sv_pair_global|regions8_ca_sv|regions8_ca_rank2|regions8_ca_wide|regions16_ca_sv|regions16_ca_rank2|regions16_ca_wide) ;;
+    regions8_sv_pair_local|regions8_rank2_pair_local|regions8_wide_pair_local|regions16_sv_pair_local|regions16_rank2_pair_local|regions16_wide_pair_local) ;;
+    regions8_ca_sv_pair_local|regions8_ca_rank2_pair_local|regions8_ca_wide_pair_local|regions16_ca_sv_pair_local|regions16_ca_rank2_pair_local|regions16_ca_wide_pair_local) ;;
     *) echo "Unknown preset: $preset" >&2; exit 2 ;;
 esac
 epochs=${EPOCHS:-80}

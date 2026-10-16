@@ -59,10 +59,12 @@ embedding. Gradients flow through the learned frames. Numerical floors precede
 roots and undefined azimuths; invalid receiving frames disable the corresponding
 bias row, and padding is masked. These choices are tested on self/beam/zero pairs.
 
-The branch materializes all particle pairs, so its low parameter count does not
-imply low runtime or memory cost. It is currently permitted only for full-particle
-references. Regional bias needs a separately specified coarse four-momentum and
-frame convention; passing `pair_bias=True` with `num_regions>0` raises an error.
+The original branch materializes all particle pairs, so its low parameter count
+does not imply low runtime or memory cost. Dense/global pair bias is permitted
+only for full-particle references. The [follow-up controls](region_followups.md)
+add `pair_bias_scope="local"`, constructing only local-edge features; this can be
+used with either full or regional global communication. A bias between coarse
+tokens still needs a separately specified coarse four-momentum/frame convention.
 
 The equivariance claim is conditional on covariantly transformed physical
 references and scalar auxiliary features, as for the original pilot. The supplied

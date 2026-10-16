@@ -44,7 +44,9 @@ class GeometricAttention(nn.Module):
 
     def forward(self, h, frames, frame_valid, mask, *, assignments=None,
                 mass=None, region_mask=None, indices=None, neighbor_mask=None,
-                tensor_gate=None, pair_bias=None):
+                tensor_gate=None, pair_bias=None, neighbor_pair_bias=None):
+        if neighbor_pair_bias is not None and (indices is None or pair_bias is not None):
+            raise ValueError("neighbor_pair_bias requires neighbor attention and no dense pair_bias")
         shape = (*h.shape[:2], 3, self.num_heads, self.head_dim)
         q_local, k_local, v_local = self.qkv(h).reshape(shape).unbind(2)
         dtype = torch.float64 if frames.dtype == torch.float64 else torch.float32
@@ -93,6 +95,11 @@ class GeometricAttention(nn.Module):
                         raise ValueError("pair_bias must have shape [B,H,N,N]")
                     local_bias = pair_bias.gather(3, indices[:, None].expand(-1, self.num_heads, -1, -1))
                     logits = logits + local_bias.permute(0, 2, 3, 1).to(dtype)
+                if neighbor_pair_bias is not None:
+                    expected = (h.shape[0], self.num_heads, h.shape[1], indices.shape[-1])
+                    if neighbor_pair_bias.shape != expected:
+                        raise ValueError("neighbor_pair_bias must have shape [B,H,N,L]")
+                    logits = logits + neighbor_pair_bias.permute(0, 2, 3, 1).to(dtype)
                 logits = logits.masked_fill(~neighbor_mask[..., None], -torch.finfo(dtype).max)
                 weight = logits.softmax(2) * neighbor_mask[..., None]
                 weight = weight / weight.sum(2, keepdim=True).clamp_min(1e-8)
