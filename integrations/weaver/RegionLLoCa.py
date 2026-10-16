@@ -51,7 +51,8 @@ def get_model(data_config, **kwargs):
     elif freeze_geometry:
         raise ValueError("freeze_geometry requires a trained geometry_checkpoint")
     _logger.info("RegionLLoCa %s: %s", preset, config)
-    _logger.info("Learned grouping: K=%d, frozen=%s", model.mod.num_regions, model.mod.geometry_frozen)
+    _logger.info("Grouping=%s: K=%d, geometry frozen=%s", model.mod.region_source,
+                 model.mod.num_regions, model.mod.geometry_frozen)
     info = dict(input_names=list(data_config.input_names),
                 input_shapes={k: (1,) + s[1:] for k, s in data_config.input_shapes.items()},
                 output_names=["softmax"],

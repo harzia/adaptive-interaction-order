@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 import torch
 from torch import nn
+from .lorentz import gather_tokens
 
 
 def pair_features(receiver, sender, eps=1e-8):
@@ -38,7 +39,8 @@ class LocalFramePairBias(nn.Module):
 
 Invalid receiving frames disable the bias for that row. Sender frame validity
 does not matter: this branch transports physical momenta, not sender latents.
-The complete matrix is O(N^2), including its feature construction.
+The complete matrix is O(N^2), including its feature construction. Supplying
+indices instead constructs only [B,H,N,L] local biases, with O(NL) features.
 """
     def __init__(self, num_heads, hidden_dim=32):
         super().__init__()
@@ -48,14 +50,20 @@ The complete matrix is O(N^2), including its feature construction.
                                  nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
                                  nn.Linear(hidden_dim, num_heads))
 
-    def forward(self, p, frames, frame_valid, mask):
+    def forward(self, p, frames, frame_valid, mask, *, indices=None, neighbor_mask=None):
         with torch.autocast(device_type=p.device.type, enabled=False):
             # Evaluate features in fp32 (fp64 for numerical checks), including
             # differentiable frames. Padded momenta have already been zeroed.
-            local_sender = torch.einsum("biac,bjc->bija", frames, p)
+            if indices is None:
+                local_sender = torch.einsum("biac,bjc->bija", frames, p)
+                valid = mask[:, :, None] & mask[:, None, :] & frame_valid[:, :, None]
+            else:
+                if neighbor_mask is None or neighbor_mask.shape != indices.shape:
+                    raise ValueError("Sparse pair bias requires neighbor_mask matching indices")
+                local_sender = torch.einsum("biac,bijc->bija", frames, gather_tokens(p, indices))
+                valid = neighbor_mask & mask[:, :, None] & frame_valid[:, :, None]
             local_receiver = torch.einsum("biac,bic->bia", frames, p)[:, :, None]
             features = pair_features(local_receiver, local_sender)
-            valid = mask[:, :, None] & mask[:, None, :] & frame_valid[:, :, None]
             features = features.masked_fill(~valid[..., None], 0)
         bias = self.net(features.to(self.net[0].weight.dtype))
         return bias.masked_fill(~valid[..., None], 0).permute(0, 3, 1, 2)

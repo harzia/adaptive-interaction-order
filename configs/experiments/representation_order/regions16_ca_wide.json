@@ -1,0 +1,9 @@
+{
+  "description": "16 exclusive Cambridge/Aachen cut regions, wide messages; no pair bias",
+  "model": {
+    "num_regions": 16,
+    "vectors": 6,
+    "region_source": "ca",
+    "ca_radius": 1000.0
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "description": "Full SV with global-only pair bias; retrained placement control",
+  "model": {
+    "num_regions": 0,
+    "pair_bias": true,
+    "pair_bias_scope": "global"
+  }
+}

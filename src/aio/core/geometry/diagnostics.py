@@ -34,7 +34,21 @@ def assignment_statistics(assignments, mask, momenta):
     mean_direction = torch.einsum("bnk,bnd->bkd", angular_weight, direction) / angular_mass.clamp_min(1e-8)[..., None]
     dispersion = (1 - mean_direction.square().sum(-1)).clamp(0, 1)
     dispersion = dispersion.masked_fill(angular_mass == 0, 0)
-    return dict(
+    # Center before taking products: subtracting nearly equal second moments is
+    # inaccurate for narrow boosted jets. These are lab-frame direction moments,
+    # assignment-weighted like the model's pooling, not energy-weighted multipoles.
+    u = F.normalize(spatial.double(), dim=-1, eps=1e-10)
+    w = angular_weight.double()
+    center = torch.einsum("bnk,bnd->bkd", w, u) / angular_mass.double().clamp_min(1e-8)[..., None]
+    residual = u[:, :, None] - center[:, None]
+    covariance = torch.einsum("bnk,bnki,bnkj->bkij", w, residual, residual)
+    covariance = covariance / angular_mass.double().clamp_min(1e-8)[..., None, None]
+    eigenvalues = torch.linalg.eigvalsh(covariance).clamp_min(0)
+    trace = eigenvalues.sum(-1)
+    shape_valid = (angular_mass > 0) & (trace > 1e-12)
+    anisotropy = ((eigenvalues[..., -1] - eigenvalues[..., 0]) / trace.clamp_min(1e-12))
+    anisotropy = anisotropy.masked_fill(~shape_valid, 0)
+    result = dict(
         region_mass=mass, region_fraction=occupancy, hard_region_mass=hard_mass,
         effective_occupied_regions=(-(occupancy * occupancy.clamp_min(1e-12).log()).sum(-1)).exp(),
         hard_occupied_regions=(hard_mass > 0).sum(-1),
@@ -42,7 +56,26 @@ def assignment_statistics(assignments, mask, momenta):
         normalized_assignment_entropy=(entropy * mask).sum(1) / count / max(math.log(k), 1e-12),
         mean_max_assignment=(a.max(-1).values * mask).sum(1) / count,
         mean_region_overlap=mean_overlap, angular_dispersion=dispersion,
-        angular_mass=angular_mass)
+        angular_mass=angular_mass, constituent_count=mask.sum(1),
+        region_mask=mass > 1e-6,
+        effective_region_constituents=mass.square() / a.square().sum(1).clamp_min(1e-12),
+        angular_covariance_eigenvalues=eigenvalues.float(),
+        angular_covariance_trace=trace.float(), angular_anisotropy=anisotropy.float(),
+        angular_shape_valid=shape_valid)
+    # Coordinates for reproducible assignment maps, centred on the input jet.
+    p = momenta.detach().double().masked_fill(~mask[..., None], 0)
+    total = p.sum(1)
+    rapidity = .5 * ((p[..., 0] + p[..., 3]).clamp_min(1e-10).log()
+                     - (p[..., 0] - p[..., 3]).clamp_min(1e-10).log())
+    jet_y = .5 * ((total[:, 0] + total[:, 3]).clamp_min(1e-10).log()
+                  - (total[:, 0] - total[:, 3]).clamp_min(1e-10).log())
+    phi = torch.atan2(p[..., 2], p[..., 1])
+    jet_phi = torch.atan2(total[:, 2], total[:, 1])
+    pt = p[..., 1:3].square().sum(-1).sqrt()
+    result.update(rapidity_offset=(rapidity - jet_y[:, None]).float().masked_fill(~mask, 0),
+                  phi_offset=((phi - jet_phi[:, None] + math.pi) % (2 * math.pi) - math.pi).float().masked_fill(~mask, 0),
+                  constituent_pt_fraction=(pt / pt.sum(1).clamp_min(1e-10)[:, None]).float())
+    return result
 
 
 def tensor_interventions(model, features, vectors, mask, labels):
@@ -78,3 +111,31 @@ def tensor_interventions(model, features, vectors, mask, labels):
                 first_order_region_delta_ce=-gradient.detach(),
                 all_tensors_off_changed_prediction=(off.argmax(-1) != base_logits.argmax(-1)),
                 logits=base_logits)
+
+
+@torch.no_grad()
+def communication_interventions(model, features, vectors, mask, labels):
+    """Remove global messages or existing pair biases in a trained checkpoint.
+
+The local graph and particle readout remain. Global gating occurs after attention
+output projection in every block, including its bias. It saves no computation.
+This tests reliance, not the performance of a model retrained without a branch.
+"""
+    if model.training or model.for_inference:
+        raise ValueError("Communication diagnostics require eval mode and raw logits")
+    baseline = model(features, vectors, mask)
+    ce = F.cross_entropy(baseline, labels, reduction="none")
+    interventions = {"global_off": {"global_gate": 0.}}
+    if model.pair_bias is not None:
+        scope = model.pair_bias_scope
+        interventions["pair_all_off"] = {"pair_bias_scope": "none"}
+        if scope in ("both", "local"):
+            interventions["pair_local_off"] = {"pair_bias_scope": "global" if scope == "both" else "none"}
+        if scope in ("both", "global"):
+            interventions["pair_global_off"] = {"pair_bias_scope": "local" if scope == "both" else "none"}
+    result = dict(base_ce=ce, logits=baseline)
+    for name, options in interventions.items():
+        logits = model(features, vectors, mask, **options)
+        result[name + "_delta_ce"] = F.cross_entropy(logits, labels, reduction="none") - ce
+        result[name + "_changed_prediction"] = logits.argmax(-1) != baseline.argmax(-1)
+    return result

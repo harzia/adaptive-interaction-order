@@ -1,0 +1,10 @@
+{
+  "description": "8 exclusive Cambridge/Aachen cut regions, sv messages; sparse local pair bias, no regional pair bias",
+  "model": {
+    "num_regions": 8,
+    "region_source": "ca",
+    "ca_radius": 1000.0,
+    "pair_bias": true,
+    "pair_bias_scope": "local"
+  }
+}
