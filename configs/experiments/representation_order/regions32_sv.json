@@ -1,0 +1,6 @@
+{
+  "description": "32 learned soft regions, scalar/vector messages",
+  "model": {
+    "num_regions": 32
+  }
+}

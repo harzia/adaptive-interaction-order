@@ -9,6 +9,7 @@ checkpoints. Supply the training run's resolved YAML when preprocessing is auto.
 from __future__ import annotations
 
 import argparse
+import hashlib
 from collections import Counter
 from pathlib import Path
 import torch
@@ -82,8 +83,9 @@ def main():
     if not sum(counts):
         parser.error("No jets passed the configured selection")
     output = {k: torch.cat(v) for k, v in result.items()}
-    output["metadata"] = dict(files=[str(p) for p in args.files], counts=counts,
-                              data_config=str(args.data_config),
+    output["metadata"] = dict(files=[str(p.resolve()) for p in args.files], counts=counts,
+                              data_config=str(args.data_config.resolve()),
+                              data_config_sha256=hashlib.sha256(args.data_config.read_bytes()).hexdigest(),
                               scanned_counts=scanned_counts, label_counts=dict(label_counts),
                               requested_labels=args.label_ids, jets_per_label=args.jets_per_label,
                               sampling="First qualifying selected jets per file, optional label caps; no shuffle/reweighting",
