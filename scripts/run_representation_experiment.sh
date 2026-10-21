@@ -8,9 +8,10 @@ Presets: full_sv, regions16_sv, regions8_sv, regions16_rank2, regions8_rank2,
          regions8_wide, regions16_wide; reference controls: part_small,
          full_sv_pair, full_sv_cls, full_sv_pair_cls.
 Follow-ups: full_sv_pair_local, full_sv_pair_global;
-           regions{8,16}_ca_{sv,rank2,wide};
-           regions{8,16}_{sv,rank2,wide}_pair_local;
-           regions{8,16}_ca_{sv,rank2,wide}_pair_local.
+           regions{4,8,16,32}_{sv,rank2,wide};
+           regions{4,8,16,32}_ca_{sv,rank2,wide};
+           regions{4,8,16,32}_{sv,rank2,wide}_pair_local;
+           regions{4,8,16,32}_ca_{sv,rank2,wide}_pair_local.
 Training options: --num-epochs N, --seed N, --train-percentage N (integer 1-100).
 Both --option VALUE and --option=VALUE are accepted for these options.
 Defaults: EPOCHS=80, SEED=123, TRAIN_PERCENTAGE=10; command-line values win.
@@ -25,13 +26,11 @@ USAGE
 }
 if [[ $# -eq 0 || "${1:-}" == --help || "${1:-}" == -h ]]; then usage; exit 0; fi
 preset=$1; shift
-case "$preset" in
-    full_sv|full_sv_pair|full_sv_cls|full_sv_pair_cls|part_small|regions16_sv|regions8_sv|regions16_rank2|regions8_rank2|regions8_wide|regions16_wide) ;;
-    full_sv_pair_local|full_sv_pair_global|regions8_ca_sv|regions8_ca_rank2|regions8_ca_wide|regions16_ca_sv|regions16_ca_rank2|regions16_ca_wide) ;;
-    regions8_sv_pair_local|regions8_rank2_pair_local|regions8_wide_pair_local|regions16_sv_pair_local|regions16_rank2_pair_local|regions16_wide_pair_local) ;;
-    regions8_ca_sv_pair_local|regions8_ca_rank2_pair_local|regions8_ca_wide_pair_local|regions16_ca_sv_pair_local|regions16_ca_rank2_pair_local|regions16_ca_wide_pair_local) ;;
-    *) echo "Unknown preset: $preset" >&2; exit 2 ;;
-esac
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+repo_root=$(cd -- "${script_dir}/.." && pwd)
+if ! [[ "$preset" =~ ^[a-zA-Z0-9_]+$ ]] || [[ ! -f "${repo_root}/configs/experiments/representation_order/${preset}.json" ]] || [[ "$preset" == common ]]; then
+    echo "Unknown preset: $preset" >&2; exit 2
+fi
 epochs=${EPOCHS:-80}
 seed=${SEED:-123}
 train_percentage=${TRAIN_PERCENTAGE:-10}
@@ -63,8 +62,6 @@ fi
 if ! [[ "$train_percentage" =~ ^([1-9]|[1-9][0-9]|100)$ ]]; then
     echo "--train-percentage / TRAIN_PERCENTAGE must be an integer from 1 to 100." >&2; exit 2
 fi
-script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-repo_root=$(cd -- "${script_dir}/.." && pwd)
 export EPOCHS="$epochs"
 geometry_args=()
 if [[ -n "${GEOMETRY_CHECKPOINT:-}" ]]; then

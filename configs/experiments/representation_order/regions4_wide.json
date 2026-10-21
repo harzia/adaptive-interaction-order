@@ -1,0 +1,7 @@
+{
+  "description": "4 regions; four extra vectors replace the 16 tensor components. Parameter/component matched, NOT measured runtime matched",
+  "model": {
+    "num_regions": 4,
+    "vectors": 6
+  }
+}
