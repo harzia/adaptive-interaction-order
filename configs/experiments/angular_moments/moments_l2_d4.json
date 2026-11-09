@@ -1,0 +1,11 @@
+{
+  "description": "Width-48 ParT with persistent angular degree <= 2, quadratic products, 4 particle blocks",
+  "family": "angular_part",
+  "model": {
+    "num_layers": 4,
+    "moment_order": 2,
+    "moment_channels": 2,
+    "moment_product_degree": 2,
+    "moment_persistent": true
+  }
+}

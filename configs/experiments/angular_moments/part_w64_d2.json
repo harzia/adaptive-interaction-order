@@ -1,0 +1,12 @@
+{
+  "description": "Ordinary width-64 ParT capacity candidate; NOT pre-claimed cost matched",
+  "family": "part",
+  "model": {
+    "num_layers": 2,
+    "embed_dims": [
+      64,
+      256,
+      64
+    ]
+  }
+}

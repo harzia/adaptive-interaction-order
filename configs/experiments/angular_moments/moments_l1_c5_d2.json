@@ -1,0 +1,11 @@
+{
+  "description": "Wider dipole-channel control (20 added components/head versus 18 for l2 c2); profile actual costs",
+  "family": "angular_part",
+  "model": {
+    "num_layers": 2,
+    "moment_order": 1,
+    "moment_channels": 5,
+    "moment_product_degree": 2,
+    "moment_persistent": true
+  }
+}

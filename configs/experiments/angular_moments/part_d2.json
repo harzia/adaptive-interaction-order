@@ -1,0 +1,7 @@
+{
+  "description": "Unmodified width-48 ParT, 2 particle blocks, 2 class blocks",
+  "family": "part",
+  "model": {
+    "num_layers": 2
+  }
+}
