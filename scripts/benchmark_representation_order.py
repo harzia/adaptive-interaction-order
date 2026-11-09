@@ -28,8 +28,8 @@ def synthetic_batch(batch_size, particles, input_dim=7, device="cpu"):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--presets", nargs="+", default=["full_sv", "regions16_sv", "regions8_sv",
-                                                       "regions16_rank2", "regions8_rank2", "regions8_wide"])
+    parser.add_argument("--presets", nargs="+")
+    parser.add_argument("--angular", action="store_true", help="Use the matched ParT/angular experiment presets")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--particles", type=int, default=128)
@@ -40,6 +40,9 @@ def main():
     parser.add_argument("--backward", action="store_true", help="Time forward+backward, excluding optimizer")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    if args.presets is None:
+        args.presets = (["part_d2", "part_d4", "part_d8", "moments_l1_d2", "moments_l2_d2"] if args.angular else
+                        ["full_sv", "regions16_sv", "regions8_sv", "regions16_rank2", "regions8_rank2", "regions8_wide"])
     if min(args.steps, args.batch_size, args.particles, args.threads) < 1 or args.warmup < 0:
         parser.error("Positive steps, sizes, threads and nonnegative warmup required")
     device = torch.device(args.device)
@@ -50,11 +53,15 @@ def main():
     rows = []
     for preset in args.presets:
         torch.manual_seed(123)
-        config = experiment_config(preset)
-        family = experiment_family(preset)
+        if args.angular:
+            from aio.models.jets.angular_experiments import experiment_config as angular_config, build_experiment as angular_build
+            family, config = angular_config(preset)
+            builder = angular_build
+        else:
+            config, family, builder = experiment_config(preset), experiment_family(preset), build_experiment
         # Fixed N for comparable shape timing: training-time random ParT trimming
         # is disabled here only. Real training keeps the original preset behavior.
-        model = build_experiment(preset, **({"trim": False} if family == "part" else {})).to(device)
+        model = builder(preset, **({"trim": False} if family in ("part", "angular_part") else {})).to(device)
         model.train(args.backward)
 
         def step():
@@ -90,6 +97,14 @@ def main():
                    message_components_per_head=(config["scalars"] + 4 * config["vectors"] + 16 * config["tensors"]
                                                 if family == "region" else config["embed_dims"][-1] // config["num_heads"]),
                    diagnostics={k: float(v) for k, v in getattr(model, "last_diagnostics", {}).items()})
+        if args.angular:
+            row.update(particle_blocks=config["num_layers"], class_blocks=config["num_cls_layers"],
+                       scalar_width=config["embed_dims"][-1],
+                       moment_order=config.get("moment_order", 0), moment_channels=config.get("moment_channels", 0),
+                       product_degree=config.get("moment_product_degree", 0),
+                       persistent=config.get("moment_persistent", False),
+                       added_value_components_per_head=(config.get("moment_channels", 0) *
+                           (9 if config.get("moment_order") == 2 else 4)))
         rows.append(row)
         print(json.dumps(row), flush=True)
         del model
@@ -97,7 +112,7 @@ def main():
                   hardware=torch.cuda.get_device_name(device) if device.type == "cuda" else platform.processor(),
                   batch_size=args.batch_size, particles=args.particles, amp=args.amp,
                   backward=args.backward, steps=args.steps, results=rows,
-                  note="Synthetic inputs; not task performance. Wide controls match components/parameters, not runtime.")
+                  note="Synthetic inputs; not task performance. Capacity controls require measured cost matching. Angular values may change SDPA kernel selection; no FLOP or speedup claim is inferred.")
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(report, indent=2) + "\n")

@@ -1,0 +1,11 @@
+{
+  "description": "Remove explicit pooled-state products; retain linear directional contractions and invariant normalization",
+  "family": "angular_part",
+  "model": {
+    "num_layers": 2,
+    "moment_order": 2,
+    "moment_channels": 2,
+    "moment_product_degree": 1,
+    "moment_persistent": true
+  }
+}

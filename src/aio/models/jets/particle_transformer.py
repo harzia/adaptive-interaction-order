@@ -677,6 +677,7 @@ class Attention(torch.nn.Module):
         value: torch.Tensor,
         key_padding_mask: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
+        extra_values: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
 
         bsz, tgt_len, _ = query.shape
@@ -723,6 +724,13 @@ class Attention(torch.nn.Module):
         k = self.k_norm(k.view(bsz, src_len, self.num_heads, self.head_dim)).transpose(1, 2)
         v = v.view(bsz, src_len, self.num_heads, self.head_dim).transpose(1, 2)
 
+        # Optional typed values share precisely the same weights AND attention
+        # dropout realization. Q/K and their scaling remain ordinary ParT.
+        if extra_values is not None:
+            if extra_values.ndim != 4 or extra_values.shape[:3] != (bsz, self.num_heads, src_len):
+                raise ValueError("extra_values must have shape [B,H,N,D_extra]")
+            v = torch.cat((v, extra_values.to(v)), dim=-1)
+
         dropout_p = self.dropout if self.training else 0.0
 
         if self.use_sdpa:
@@ -739,6 +747,9 @@ class Attention(torch.nn.Module):
             attn_output = attn_weight @ v  # (bsz, num_heads, tgt_len, head_dim)
 
         attn_output = attn_output.transpose(1, 2).contiguous()  # (bsz, tgt_len, num_heads, head_dim)
+        extra_output = None
+        if extra_values is not None:
+            attn_output, extra_output = attn_output.split((self.head_dim, extra_values.shape[-1]), dim=-1)
 
         if self.headwise_attn_output_gate:
             gate_score = torch.sigmoid(self.gate_proj(query))  # (bsz, tgt_len, num_heads)
@@ -749,7 +760,7 @@ class Attention(torch.nn.Module):
 
         attn_output = attn_output.reshape(bsz, tgt_len, self.embed_dim)
         attn_output = self.out_proj(attn_output)
-        return attn_output, None
+        return attn_output, extra_output
 
 
 class LayerScale(nn.Module):
@@ -874,7 +885,8 @@ class Block(nn.Module):
         self.c_attn = nn.Parameter(torch.ones(num_heads), requires_grad=True) if scale_heads else None
         self.w_resid = nn.Parameter(torch.ones(embed_dim), requires_grad=True) if scale_resids else None
 
-    def forward(self, x, x_cls=None, padding_mask=None, attn_mask=None):
+    def forward(self, x, x_cls=None, padding_mask=None, attn_mask=None,
+                extra_values=None, extra_update=None):
         """
         Args:
             x (Tensor): input to the layer of shape `(batch, seq_len, embed_dim)`
@@ -887,7 +899,11 @@ class Block(nn.Module):
             encoded output of shape `(batch, seq_len, embed_dim)`
         """
 
+        if (extra_values is None) != (extra_update is None):
+            raise ValueError("extra_values and extra_update must be supplied together")
         if x_cls is not None:
+            if extra_values is not None:
+                raise ValueError("Typed values are defined only for particle self-attention")
             with torch.no_grad():
                 # prepend one element for x_cls: -> (batch, 1+seq_len)
                 padding_mask = torch.cat((torch.zeros_like(padding_mask[:, :1]), padding_mask), dim=1)
@@ -901,7 +917,8 @@ class Block(nn.Module):
                 attn_mask = torch.mul(self.c_mask, attn_mask)
             residual = x
             x = self.pre_attn_norm(x)
-            x = self.attn(x, x, x, key_padding_mask=padding_mask, attn_mask=attn_mask)[0]  # (batch, seq_len, embed_dim)
+            kwargs = {"extra_values": extra_values} if extra_values is not None else {}
+            x, extra_output = self.attn(x, x, x, key_padding_mask=padding_mask, attn_mask=attn_mask, **kwargs)
 
         if self.c_attn is not None:
             bsz, tgt_len, _ = x.size()
@@ -912,6 +929,9 @@ class Block(nn.Module):
         x = self.dropout(x)
         x = self.drop_path1(self.ls1(x))
         x = x + residual
+
+        if extra_update is not None:
+            x = extra_update(x, extra_output)
 
         residual = x
         x = self.pre_fc_norm(x)
