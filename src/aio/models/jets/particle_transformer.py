@@ -836,6 +836,7 @@ class Block(nn.Module):
         scale_heads=True,
         scale_resids=True,
         for_inference=False,
+        attention_factory=Attention,
     ):
         super().__init__()
 
@@ -848,7 +849,7 @@ class Block(nn.Module):
         # native (fused) `nn.RMSNorm` for training performance
         norm_layer = (RMSNorm if for_inference else nn.RMSNorm) if use_rmsnorm else nn.LayerNorm
         self.pre_attn_norm = norm_layer(embed_dim)
-        self.attn = Attention(
+        self.attn = attention_factory(
             embed_dim,
             num_heads,
             dropout=attn_dropout,
@@ -886,7 +887,7 @@ class Block(nn.Module):
         self.w_resid = nn.Parameter(torch.ones(embed_dim), requires_grad=True) if scale_resids else None
 
     def forward(self, x, x_cls=None, padding_mask=None, attn_mask=None,
-                extra_values=None, extra_update=None):
+                extra_values=None, extra_update=None, attention_kwargs=None):
         """
         Args:
             x (Tensor): input to the layer of shape `(batch, seq_len, embed_dim)`
@@ -899,6 +900,7 @@ class Block(nn.Module):
             encoded output of shape `(batch, seq_len, embed_dim)`
         """
 
+        attention_kwargs = attention_kwargs or {}
         if (extra_values is None) != (extra_update is None):
             raise ValueError("extra_values and extra_update must be supplied together")
         if x_cls is not None:
@@ -911,13 +913,15 @@ class Block(nn.Module):
             residual = x_cls
             u = torch.cat((x_cls, x), dim=1)  # (batch, 1+seq_len, embed_dim)
             u = self.pre_attn_norm(u)
-            x = self.attn(x_cls, u, u, key_padding_mask=padding_mask)[0]  # (batch, 1, embed_dim)
+            x = self.attn(x_cls, u, u, key_padding_mask=padding_mask, **attention_kwargs)[0]  # (batch, 1, embed_dim)
         else:
             if self.c_mask is not None and attn_mask is not None:
                 attn_mask = torch.mul(self.c_mask, attn_mask)
             residual = x
             x = self.pre_attn_norm(x)
-            kwargs = {"extra_values": extra_values} if extra_values is not None else {}
+            kwargs = dict(attention_kwargs)
+            if extra_values is not None:
+                kwargs["extra_values"] = extra_values
             x, extra_output = self.attn(x, x, x, key_padding_mask=padding_mask, attn_mask=attn_mask, **kwargs)
 
         if self.c_attn is not None:

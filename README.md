@@ -10,3 +10,5 @@ Next experiments: [region-structure diagnostics, shared geometry, local pair con
 Adaptive-order feasibility: [frozen-expert complementarity, learned jet routing, and matched K=4/8/16/32 sweeps](docs/frozen_expert_routing.md).
 
 Angular-moment attention on actual ParT: [small/deeper baselines, explicit vector and quadrupole channels, controls, and launch commands](docs/angular_moments.md).
+
+[Relative attention for JetClass-II](docs/relative_attention.md) includes the hybrid and rotary architectures, matched controls, training commands, checkpoint diagnostics, and evaluation.
