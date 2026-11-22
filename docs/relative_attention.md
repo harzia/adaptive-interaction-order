@@ -1,53 +1,55 @@
 # Relative attention for JetClass-II
 
-The primary comparison is **C vs H**. Both give each head a learned linear map of the four ParT pair features per particle block. H also rotates value planes into a common frame before aggregation and rotates the result back into the receiving particle's frame. E uses rotary queries and keys as well, eliminating explicit pair features. All three use full softmax attention over valid constituents.
+Compare **linear pair scores with plain values** against **linear pair scores with 15 rotary value planes**. Both give each head a learned linear map of the four ParT pair features per particle block. The latter rotates value planes into a common frame before aggregation and rotates the result back into the receiving particle's frame. The fully rotary model uses rotary queries and keys as well, eliminating explicit pair features. All three use full softmax attention over valid constituents.
 
 ## Run the pilot
 
-Use the same Weaver environment as your existing JetClass-II runs. The shared launcher uses the repo's Weaver fork options, including `--seed` and `--wandb-dir`. Set `DATA_PATH` to the parent of `JetClass2/Pythia/data` and `OUTPUT_PATH` to your run directory. From the checkout:
+Use the same Weaver environment as your existing JetClass-II runs. The shared launcher uses the repo's Weaver fork options, including `--seed` and `--wandb-dir`. Set `DATA_PATH` to the parent of `JetClass2/Pythia/data` and `OUTPUT_PATH` to your run directory. From the checkout, run the matched pair:
 
 ```bash
 export DATA_PATH=/path/to/datasets
 export OUTPUT_PATH=/path/to/runs
 
-python scripts/run_relative_experiment.py C
-python scripts/run_relative_experiment.py H
+python scripts/run_relative_experiment.py linear_pair_plain_values_d4
+python scripts/run_relative_experiment.py linear_pair_rotary_values15_d4
 ```
 
-Each command trains and tests one four-block, width-48 model on the seven kinematic features. Defaults are 10% of the training files, 80 epochs, seed 123, and the existing validation and test splits. The usual `DDP_NGPUS`, `BATCH_SIZE`, `NUM_WORKERS`, `EPOCHS`, `TRAIN_PERCENTAGE`, and `SEED` settings apply. Explicit CLI options take precedence. Outputs go to `$OUTPUT_PATH/RelativeParT/JetClass2_kin/relative_<preset>_seed<seed>/`. Use `COMMENT` to name a single run or `--comment-prefix` for a series. Give overrides a fresh run name.
+Each command trains and tests one four-block, width-48 model on the seven kinematic features. Defaults are 10% of the training files, 80 epochs, seed 123, and the existing validation and test splits. The usual `DDP_NGPUS`, `BATCH_SIZE`, `NUM_WORKERS`, `EPOCHS`, `TRAIN_PERCENTAGE`, and `SEED` settings apply. Explicit CLI options take precedence. Outputs go to `$OUTPUT_PATH/RelativeParT/JetClass2_kin/relative_<preset>_seed<seed>/`. Use `COMMENT` to name a single run or `--comment-prefix` for a series. Give architectural overrides a fresh `COMMENT` describing the change.
 
 ```bash
 # Preview the four primary commands without data or a GPU
 python scripts/run_relative_experiment.py suite --dry-run
 
-# Run C, H, B, E sequentially from scratch
+# Run the two linear-pair models, the plain baseline, then the fully rotary model
 python scripts/run_relative_experiment.py suite
 
 # Compare two seeds for one arm, or change depth or data budget
-python scripts/run_relative_experiment.py E --seed 123 --seed 124
-COMMENT=relative_H_d2_seed124 python scripts/run_relative_experiment.py H \
+python scripts/run_relative_experiment.py rotary_qk30_rotary_values15_d4 --seed 123 --seed 124
+COMMENT=relative_linear_pair_rotary_values15_d2_seed124 python scripts/run_relative_experiment.py linear_pair_rotary_values15_d4 \
     --seed 124 --num-epochs 40 --train-percentage 10 -o num_layers 2
 
 # Test the default best checkpoint, or an explicit checkpoint with matching architecture
-python scripts/run_relative_experiment.py H --test-only
-python scripts/run_relative_experiment.py E_small --weights /path/to/net_best_epoch_state.pt
+python scripts/run_relative_experiment.py linear_pair_rotary_values15_d4 --test-only
+python scripts/run_relative_experiment.py rotary_qk12_rotary_values6_d4 --weights /path/to/net_best_epoch_state.pt
 ```
 
-| Preset | Scores | Values | Parameters at depth 4 |
-|---|---|---|---:|
-| A | Original ParT pair MLP, width 64 | Ordinary | 323,364 |
-| B | Content only | Ordinary | 314,064 |
-| C | Linear pair bias | Ordinary | 314,144 |
-| H | Linear pair bias | 15 planes | 361,424 |
-| H_small | Linear pair bias | 6 planes | 333,056 |
-| E | Rotary, 30 planes | 15 planes | 456,880 |
-| E_small | Rotary, 12 planes | 6 planes | 371,200 |
-| D | Rotary, 30 planes | Ordinary | 409,600 |
-| C8 | Original ParT pair MLP, width 8 | Ordinary | 314,348 |
-| F | Jet-rest-frame harmonics through degree 2 | Ordinary | 314,096 |
-| G | Learned low-rank coordinate bias | Ordinary | 323,024 |
+| Preset filename (without `.json`) | Proposal label | Scores | Values | Parameters at depth 4 |
+|---|---|---|---|---:|
+| `part_pair_mlp64_d4` | A | Original ParT pair MLP, width 64 | Ordinary | 323,364 |
+| `plain_transformer_d4` | B | Content only | Ordinary | 314,064 |
+| `linear_pair_plain_values_d4` | C | Linear pair bias | Ordinary | 314,144 |
+| `linear_pair_rotary_values15_d4` | H | Linear pair bias | 15 planes | 361,424 |
+| `linear_pair_rotary_values6_d4` | H_small | Linear pair bias | 6 planes | 333,056 |
+| `rotary_qk30_rotary_values15_d4` | E | Rotary, 30 planes | 15 planes | 456,880 |
+| `rotary_qk12_rotary_values6_d4` | E_small | Rotary, 12 planes | 6 planes | 371,200 |
+| `rotary_qk30_plain_values_d4` | D | Rotary, 30 planes | Ordinary | 409,600 |
+| `part_pair_mlp8_d4` | C8 | Original ParT pair MLP, width 8 | Ordinary | 314,348 |
+| `rest_harmonics_l2_plain_values_d4` | F | Jet-rest-frame harmonics through degree 2 | Ordinary | 314,096 |
+| `low_rank8_plain_values_d4` | G | Learned low-rank coordinate bias | Ordinary | 323,024 |
 
-A instantiates the original `part_d4`. An existing checkpoint or metrics file can serve as A when preprocessing, depth, seed, and training recipe match. C8, F and G are follow-up controls. F weights the existing dipole and STF quadrupole inner products separately per head. The constant harmonic cancels in the softmax. G maps coordinates through a width-32 GELU MLP to independent rank-8 query and key features per head (`-o control_rank N`).
+The width-64 pair MLP reference instantiates the original `part_d4`. An existing checkpoint or metrics file can serve as A when preprocessing, depth, seed, and training recipe match. The narrow pair MLP, harmonics, and low-rank presets are follow-up controls. The harmonic control weights the existing dipole and STF quadrupole inner products separately per head. The constant harmonic cancels in the softmax. The low-rank control maps coordinates through a width-32 GELU MLP to independent rank-8 query and key features per head (`-o control_rank N`).
+
+The [preset directory](../src/aio/models/jets/presets) contains one JSON file per row and a shared `common.json`. The proposal labels remain accepted as aliases. Both spellings produce the descriptive run name by default. To evaluate an existing letter-named run, pass its checkpoint with `--weights` or supply its original directory name in `COMMENT` with `--test-only`.
 
 ## Coordinates and switches
 
@@ -72,7 +74,7 @@ By default class attention, FFNs, input embedding and the classifier follow the 
 
 ```bash
 python scripts/verify_relative_attention.py
-python scripts/export_representation_inputs.py \
+python scripts/export_relative_inputs.py \
     --files "$DATA_PATH"/JetClass2/Pythia/data/{Res2P_0200,Res34P_0860,QCD_0280}.parquet \
     --output /tmp/kin-validation.pt
 python scripts/fit_relative_pair_bias.py --checkpoint /path/to/part_d4_best.pt \
@@ -87,16 +89,16 @@ Use the existing JetClass-II evaluator on all ROOT prediction shards from one ru
 
 ```bash
 runs="$OUTPUT_PATH/RelativeParT/JetClass2_kin"
-python scripts/evaluate_relative_attention.py --predictions "$runs"/relative_H_seed123/results/pred*.root
+python scripts/evaluate_relative_attention.py --predictions "$runs"/relative_linear_pair_rotary_values15_d4_seed123/results/pred*.root
 
 # Reuse saved metrics and compute (log H - log B) / (log A - log B)
-python scripts/evaluate_relative_attention.py --metrics "$runs/relative_H_seed123/results/metrics.json" \
+python scripts/evaluate_relative_attention.py --metrics "$runs/relative_linear_pair_rotary_values15_d4_seed123/results/metrics.json" \
     --reference /path/to/part_d4/results/metrics.json \
-    --plain "$runs/relative_B_seed123/results/metrics.json"
+    --plain "$runs/relative_plain_transformer_d4_seed123/results/metrics.json"
 
 # Time the same fixed padded batch and occupancy distribution for every arm
-PYTHONPATH=src:. python scripts/benchmark_representation_order.py --relative --device cuda \
-    --inputs /tmp/kin-validation.pt --batch-size 32 --amp --backward --presets A C H E
+python scripts/benchmark_relative_attention.py --device cuda \
+    --inputs /tmp/kin-validation.pt --batch-size 32 --amp --backward --presets part_pair_mlp64_d4 linear_pair_plain_values_d4 linear_pair_rotary_values15_d4 rotary_qk30_rotary_values15_d4
 ```
 
 The benchmark reports mean valid particles, milliseconds per batch, throughput, parameter count, and CUDA peak allocated memory. Omit `--backward` to time inference. Without `--inputs`, it uses an all-valid synthetic batch. Both timing modes disable random trimming to hold the input shape fixed. Use multiple batches representative of production when comparing costs.

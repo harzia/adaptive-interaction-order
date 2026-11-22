@@ -91,7 +91,7 @@ def test_zero_planes_equal_plain_attention():
     torch.testing.assert_close(a, b)
 
 
-@pytest.mark.parametrize("preset", ["H", "E", "H_small", "E_small", "C", "D", "F", "G"])
+@pytest.mark.parametrize("preset", ["linear_pair_rotary_values15_d4", "rotary_qk30_rotary_values15_d4", "linear_pair_rotary_values6_d4", "rotary_qk12_rotary_values6_d4", "linear_pair_plain_values_d4", "rotary_qk30_plain_values_d4", "rest_harmonics_l2_plain_values_d4", "low_rank8_plain_values_d4"])
 def test_weaver_forward_backward_and_permutation_padding(preset):
     net = model(preset, num_layers=2).eval()
     points, x, v, mask = batch()
@@ -110,11 +110,11 @@ def test_weaver_forward_backward_and_permutation_padding(preset):
     torch.optim.AdamW(net.parameters()).step()
 
 
-@pytest.mark.parametrize("preset", ["H", "E"])
+@pytest.mark.parametrize("preset", ["linear_pair_rotary_values15_d4", "rotary_qk30_rotary_values15_d4"])
 def test_class_origin_and_ablation_switches(preset):
     pts, x, v, mask = batch()
     net = model(preset, num_layers=2, class_at_origin=True, directions=4, momentum=False,
-                freeze_frequencies=True, scale_invariant_pairs=(preset == "H"), export_embed=True).eval()
+                freeze_frequencies=True, scale_invariant_pairs=(preset == "linear_pair_rotary_values15_d4"), export_embed=True).eval()
     assert "blocks.0.attn.omega_value" in dict(net.mod.named_buffers())
     assert net.mod.blocks[0].attn.omega_value.shape == (4, 16, 2)
     assert net(pts, x, v, mask).shape == (3, 236)
@@ -135,8 +135,8 @@ def test_exact_pair_features_and_unstandardized_coordinates():
     torch.testing.assert_close(pair_features(v, v, True), ref[..., 1:3])
 
 
-@pytest.mark.parametrize("preset,counts", [("H", [280136, 361424]), ("H_small", [265952, 333056]),
-                                          ("E", [327864, 456880]), ("E_small", [285024, 371200])])
+@pytest.mark.parametrize("preset,counts", [("linear_pair_rotary_values15_d4", [280136, 361424]), ("linear_pair_rotary_values6_d4", [265952, 333056]),
+                                          ("rotary_qk30_rotary_values15_d4", [327864, 456880]), ("rotary_qk12_rotary_values6_d4", [285024, 371200])])
 def test_proposal_sizes(preset, counts):
     for d, count in zip((2, 4), counts):
         assert sum(p.numel() for p in model(preset, num_layers=d).parameters()) == count
@@ -152,7 +152,7 @@ def test_kernel_fits():
 def test_geometry_uses_same_trim_indices_and_rotary_skips_pairs(monkeypatch):
     from aio.models.jets import relative_particle_transformer as rel
     pts, x, v, mask = batch()
-    net = model("E", num_layers=2).eval()
+    net = model("rotary_qk30_rotary_values15_d4", num_layers=2).eval()
     idx = torch.tensor([3, 0, 4, 2])
     def unexpected_pair(*args):
         raise AssertionError("Rotary arm built a per-pair feature tensor")
@@ -174,9 +174,10 @@ def test_launcher_suite_order_and_checkpoint_args(tmp_path, monkeypatch, capsys)
     main()
     lines = capsys.readouterr().out.splitlines()
     assert len(lines) == 4
-    assert all(f"relative_{arm}_seed124" in line for arm, line in zip("CHBE", lines))
+    assert all(f"relative_{arm}_seed124" in line for arm, line in zip(("linear_pair_plain_values_d4", "linear_pair_rotary_values15_d4",
+                           "plain_transformer_d4", "rotary_qk30_rotary_values15_d4"), lines))
     monkeypatch.setenv("COMMENT", "my_hybrid")
-    monkeypatch.setattr(sys, "argv", ["run", "H", "--dry-run", "--num-epochs=2", "--train-percentage=25",
+    monkeypatch.setattr(sys, "argv", ["run", "linear_pair_rotary_values15_d4", "--dry-run", "--num-epochs=2", "--train-percentage=25",
                                       "--weights", "my checkpoint.pt", "-o", "num_layers", "2"])
     main()
     import shlex
@@ -185,3 +186,12 @@ def test_launcher_suite_order_and_checkpoint_args(tmp_path, monkeypatch, capsys)
     assert cmd[cmd.index("--train-percentage") + 1] == "25"
     assert cmd[-5:] == ["--weights", "my checkpoint.pt", "-o", "num_layers", "2"]
     assert not (tmp_path / "unused").exists()
+
+
+def test_named_presets_and_legacy_aliases():
+    from aio.models.jets.relative_experiments import LEGACY_NAMES, PRESETS, relative_config
+    assert set(PRESETS) == set(LEGACY_NAMES.values())
+    for alias, name in LEGACY_NAMES.items():
+        cfg = relative_config(name)
+        assert cfg == relative_config(alias)
+        assert name.endswith(f"_d{cfg['num_layers']}")

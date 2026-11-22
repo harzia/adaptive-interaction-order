@@ -677,7 +677,6 @@ class Attention(torch.nn.Module):
         value: torch.Tensor,
         key_padding_mask: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
-        extra_values: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
 
         bsz, tgt_len, _ = query.shape
@@ -724,13 +723,6 @@ class Attention(torch.nn.Module):
         k = self.k_norm(k.view(bsz, src_len, self.num_heads, self.head_dim)).transpose(1, 2)
         v = v.view(bsz, src_len, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # Optional typed values share precisely the same weights AND attention
-        # dropout realization. Q/K and their scaling remain ordinary ParT.
-        if extra_values is not None:
-            if extra_values.ndim != 4 or extra_values.shape[:3] != (bsz, self.num_heads, src_len):
-                raise ValueError("extra_values must have shape [B,H,N,D_extra]")
-            v = torch.cat((v, extra_values.to(v)), dim=-1)
-
         dropout_p = self.dropout if self.training else 0.0
 
         if self.use_sdpa:
@@ -747,9 +739,6 @@ class Attention(torch.nn.Module):
             attn_output = attn_weight @ v  # (bsz, num_heads, tgt_len, head_dim)
 
         attn_output = attn_output.transpose(1, 2).contiguous()  # (bsz, tgt_len, num_heads, head_dim)
-        extra_output = None
-        if extra_values is not None:
-            attn_output, extra_output = attn_output.split((self.head_dim, extra_values.shape[-1]), dim=-1)
 
         if self.headwise_attn_output_gate:
             gate_score = torch.sigmoid(self.gate_proj(query))  # (bsz, tgt_len, num_heads)
@@ -760,7 +749,7 @@ class Attention(torch.nn.Module):
 
         attn_output = attn_output.reshape(bsz, tgt_len, self.embed_dim)
         attn_output = self.out_proj(attn_output)
-        return attn_output, extra_output
+        return attn_output, None
 
 
 class LayerScale(nn.Module):
@@ -886,8 +875,7 @@ class Block(nn.Module):
         self.c_attn = nn.Parameter(torch.ones(num_heads), requires_grad=True) if scale_heads else None
         self.w_resid = nn.Parameter(torch.ones(embed_dim), requires_grad=True) if scale_resids else None
 
-    def forward(self, x, x_cls=None, padding_mask=None, attn_mask=None,
-                extra_values=None, extra_update=None, attention_kwargs=None):
+    def forward(self, x, x_cls=None, padding_mask=None, attn_mask=None, attention_kwargs=None):
         """
         Args:
             x (Tensor): input to the layer of shape `(batch, seq_len, embed_dim)`
@@ -901,11 +889,7 @@ class Block(nn.Module):
         """
 
         attention_kwargs = attention_kwargs or {}
-        if (extra_values is None) != (extra_update is None):
-            raise ValueError("extra_values and extra_update must be supplied together")
         if x_cls is not None:
-            if extra_values is not None:
-                raise ValueError("Typed values are defined only for particle self-attention")
             with torch.no_grad():
                 # prepend one element for x_cls: -> (batch, 1+seq_len)
                 padding_mask = torch.cat((torch.zeros_like(padding_mask[:, :1]), padding_mask), dim=1)
@@ -919,10 +903,7 @@ class Block(nn.Module):
                 attn_mask = torch.mul(self.c_mask, attn_mask)
             residual = x
             x = self.pre_attn_norm(x)
-            kwargs = dict(attention_kwargs)
-            if extra_values is not None:
-                kwargs["extra_values"] = extra_values
-            x, extra_output = self.attn(x, x, x, key_padding_mask=padding_mask, attn_mask=attn_mask, **kwargs)
+            x = self.attn(x, x, x, key_padding_mask=padding_mask, attn_mask=attn_mask, **attention_kwargs)[0]  # (batch, seq_len, embed_dim)
 
         if self.c_attn is not None:
             bsz, tgt_len, _ = x.size()
@@ -933,9 +914,6 @@ class Block(nn.Module):
         x = self.dropout(x)
         x = self.drop_path1(self.ls1(x))
         x = x + residual
-
-        if extra_update is not None:
-            x = extra_update(x, extra_output)
 
         residual = x
         x = self.pre_fc_norm(x)
@@ -1272,201 +1250,6 @@ class ParticleTransformer(nn.Module):
             output = torch.softmax(output, dim=1)
         # print('output:\n', output)
         return output
-
-
-class ParticleTransformerTagger(nn.Module):
-    def __init__(
-        self,
-        pf_input_dim,
-        sv_input_dim,
-        num_classes=None,
-        # network configurations
-        pair_input_type="pp",
-        pair_input_dim=None,
-        pair_extra_dim=0,
-        remove_self_pair=False,
-        use_pre_activation_pair=True,
-        embed_dims=(128, 512, 128),
-        pair_embed_dims=(64, 64, 64),
-        num_heads=8,
-        num_layers=8,
-        num_cls_layers=2,
-        block_params=None,
-        cls_block_params=None,
-        fc_params=(),
-        activation="gelu",
-        # misc
-        version=1,
-        weight_init="moco",
-        fix_init=True,
-        trim=True,
-        for_inference=False,
-        for_segmentation=False,
-        use_amp=False,
-        compile_model=False,
-        **kwargs,
-    ) -> None:
-        super().__init__(**kwargs)
-
-        self.use_amp = use_amp
-
-        self.pf_trimmer = SequenceTrimmer(enabled=trim and not for_inference)
-        self.sv_trimmer = SequenceTrimmer(enabled=trim and not for_inference)
-
-        self.pf_embed = Embed(pf_input_dim, embed_dims, activation=activation)
-        self.sv_embed = Embed(sv_input_dim, embed_dims, activation=activation)
-
-        self.part = ParticleTransformer(
-            input_dim=embed_dims[-1],
-            num_classes=num_classes,
-            # network configurations
-            pair_input_type=pair_input_type,
-            pair_input_dim=pair_input_dim,
-            pair_extra_dim=pair_extra_dim,
-            remove_self_pair=remove_self_pair,
-            use_pre_activation_pair=use_pre_activation_pair,
-            embed_dims=[],
-            pair_embed_dims=pair_embed_dims,
-            num_heads=num_heads,
-            num_layers=num_layers,
-            num_cls_layers=num_cls_layers,
-            block_params=block_params,
-            cls_block_params=cls_block_params,
-            fc_params=fc_params,
-            activation=activation,
-            # misc
-            version=version,
-            weight_init=weight_init,
-            fix_init=fix_init,
-            trim=False,
-            for_inference=for_inference,
-            for_segmentation=for_segmentation,
-            use_amp=use_amp,
-        )
-
-    @torch.jit.ignore
-    def no_weight_decay(self):
-        return {
-            "part.cls_token",
-        }
-
-    def forward(self, pf_x, pf_v=None, pf_mask=None, sv_x=None, sv_v=None, sv_mask=None):
-        # x: (N, C, P)
-        # v: (N, 4, P) [px,py,pz,energy]
-        # mask: (N, 1, P) -- real particle = 1, padded = 0
-
-        with torch.no_grad():
-            pf_x, pf_v, pf_mask, _ = self.pf_trimmer(pf_x, pf_v, pf_mask)
-            sv_x, sv_v, sv_mask, _ = self.sv_trimmer(sv_x, sv_v, sv_mask)
-            v = torch.cat([pf_v, sv_v], dim=2)
-            mask = torch.cat([pf_mask, sv_mask], dim=2)
-
-        pf_x = self.pf_embed(pf_x)  # after embed: (batch, seq_len, embed_dim)
-        sv_x = self.sv_embed(sv_x)
-        x = torch.cat([pf_x, sv_x], dim=1)
-
-        return self.part(x, v, mask)
-
-
-class ParticleTransformerTaggerWithExtraPairFeatures(nn.Module):
-    def __init__(
-        self,
-        pf_input_dim,
-        sv_input_dim,
-        num_classes=None,
-        # network configurations
-        pair_input_type="pp",
-        pair_input_dim=None,
-        pair_extra_dim=0,
-        remove_self_pair=False,
-        use_pre_activation_pair=True,
-        embed_dims=(128, 512, 128),
-        pair_embed_dims=(64, 64, 64),
-        num_heads=8,
-        num_layers=8,
-        num_cls_layers=2,
-        block_params=None,
-        cls_block_params=None,
-        fc_params=(),
-        activation="gelu",
-        # misc
-        version=1,
-        weight_init="moco",
-        fix_init=True,
-        trim=True,
-        for_inference=False,
-        for_segmentation=False,
-        use_amp=False,
-        compile_model=False,
-        **kwargs,
-    ) -> None:
-        super().__init__(**kwargs)
-
-        self.use_amp = use_amp
-        self.for_inference = for_inference
-
-        self.pf_trimmer = SequenceTrimmer(enabled=trim and not for_inference)
-        self.sv_trimmer = SequenceTrimmer(enabled=trim and not for_inference)
-
-        self.pf_embed = Embed(pf_input_dim, embed_dims, activation=activation)
-        self.sv_embed = Embed(sv_input_dim, embed_dims, activation=activation)
-
-        self.part = ParticleTransformer(
-            input_dim=embed_dims[-1],
-            num_classes=num_classes,
-            # network configurations
-            pair_input_type=pair_input_type,
-            pair_input_dim=pair_input_dim,
-            pair_extra_dim=pair_extra_dim,
-            remove_self_pair=remove_self_pair,
-            use_pre_activation_pair=use_pre_activation_pair,
-            embed_dims=[],
-            pair_embed_dims=pair_embed_dims,
-            num_heads=num_heads,
-            num_layers=num_layers,
-            num_cls_layers=num_cls_layers,
-            block_params=block_params,
-            cls_block_params=cls_block_params,
-            fc_params=fc_params,
-            activation=activation,
-            # misc
-            version=version,
-            weight_init=weight_init,
-            fix_init=fix_init,
-            trim=False,
-            for_inference=for_inference,
-            for_segmentation=for_segmentation,
-            use_amp=use_amp,
-        )
-
-    @torch.jit.ignore
-    def no_weight_decay(self):
-        return {
-            "part.cls_token",
-        }
-
-    def forward(self, pf_x, pf_v=None, pf_mask=None, sv_x=None, sv_v=None, sv_mask=None, pf_uu=None, pf_uu_idx=None):
-        # x: (N, C, P)
-        # v: (N, 4, P) [px,py,pz,energy]
-        # mask: (N, 1, P) -- real particle = 1, padded = 0
-
-        with torch.no_grad():
-            if not self.for_inference:
-                if pf_uu_idx is not None:
-                    pf_uu = build_sparse_tensor(pf_uu, pf_uu_idx, pf_x.size(-1))
-
-            pf_x, pf_v, pf_mask, pf_uu = self.pf_trimmer(pf_x, pf_v, pf_mask, pf_uu)
-            sv_x, sv_v, sv_mask, _ = self.sv_trimmer(sv_x, sv_v, sv_mask)
-            v = torch.cat([pf_v, sv_v], dim=2)
-            mask = torch.cat([pf_mask, sv_mask], dim=2)
-            uu = torch.zeros(v.size(0), pf_uu.size(1), v.size(2), v.size(2), dtype=v.dtype, device=v.device)
-            uu[:, :, : pf_x.size(2), : pf_x.size(2)] = pf_uu
-
-        pf_x = self.pf_embed(pf_x)  # after embed: (batch, seq_len, embed_dim)
-        sv_x = self.sv_embed(sv_x)
-        x = torch.cat([pf_x, sv_x], dim=1)
-
-        return self.part(x, v, mask, uu)
 
 
 ### weight initialization methods ###

@@ -1,14 +1,10 @@
-# Adaptive interaction order
-Conditional computation over relational arity in higher-order attention.
+# Relative particle attention for JetClass-II
 
-Learned-region representation-order experiments: [implementation and run guide](docs/representation_order.md).
+Train the hybrid model with exact linear pair scores and 15 rotary value planes, or the fully rotary model with 30 query/key planes and 15 value planes. Both use four particle blocks and the same ParT class readout. Set `DATA_PATH` and `OUTPUT_PATH` as in your JetClass-II Weaver environment.
 
-Additional baseline experiments and checkpoint inspection: [small ParT, pair bias, readout, and diagnostics](docs/representation_controls.md).
+```bash
+python scripts/run_relative_experiment.py linear_pair_rotary_values15_d4
+python scripts/run_relative_experiment.py rotary_qk30_rotary_values15_d4
+```
 
-Next experiments: [region-structure diagnostics, shared geometry, local pair controls, and Lund/Cambridge–Aachen hierarchy cuts](docs/region_followups.md).
-
-Adaptive-order feasibility: [frozen-expert complementarity, learned jet routing, and matched K=4/8/16/32 sweeps](docs/frozen_expert_routing.md).
-
-Angular-moment attention on actual ParT: [small/deeper baselines, explicit vector and quadrupole channels, controls, and launch commands](docs/angular_moments.md).
-
-[Relative attention for JetClass-II](docs/relative_attention.md) includes the hybrid and rotary architectures, matched controls, training commands, checkpoint diagnostics, and evaluation.
+The [model presets](src/aio/models/jets/presets) use the same names as the launcher and output directories. The [run guide](docs/relative_attention.md) lists the matched baselines and ablations, the original proposal labels, checkpoint evaluation, and profiling commands.

@@ -32,45 +32,33 @@ DATADIR="${DATA_PATH}/JetClass2/Pythia/data"
 OUTPUT_VOL_DIR="${OUTPUT_PATH}"
 
 
-MODEL_NAME=${1:-}
-if ! [[ "${MODEL_NAME}" =~ ^(ParT|AdaParT|F3ParT|RegionLLoCa|AngularParT|RelativeParT)$ ]]; then
-    echo "Invalid model ${MODEL_NAME:-<empty>}! Valid options: ParT, AdaParT, F3ParT, RegionLLoCa, AngularParT, RelativeParT."
-    exit 1
+MODEL_NAME=RelativeParT
+FEATURE_TYPE=kin
+if [[ "${1:-}" != "$MODEL_NAME" || "${2:-}" != "$FEATURE_TYPE" ]]; then
+    echo "Usage: $0 RelativeParT kin [training options] [Weaver arguments...]" >&2
+    exit 2
 fi
-shift
-
-if [[ -z "${1:-}" ]] || [[ "${1:-}" == --* ]]; then
-    echo "Error: The second argument must be the feature type (full, kin, kinpid)."
-    exit 1
-fi
-
-FEATURE_TYPE=$1
-shift
-
-if ! [[ "${FEATURE_TYPE}" =~ ^(full|kin|kinpid)$ ]]; then
-    echo "Invalid feature type ${FEATURE_TYPE}!"
-    exit 1
-fi
+shift 2
 
 # ---------------------------------------------------------------------------
 # Script-specific arguments
 #
 # Normal training:
-#   ./run_jetclass2.sh ParT kin --train-percentage 10 [Weaver args...]
+#   ./run_jetclass2.sh RelativeParT kin --train-percentage 10 [Weaver args...]
 #
 # Test-only, explicit checkpoint:
-#   ./run_jetclass2.sh ParT kin \
+#   ./run_jetclass2.sh RelativeParT kin \
 #       --test-only \
 #       --weights /path/to/net_best_epoch_state.pt \
 #       [Weaver args...]
 #
 # Supplying --weights automatically enables test-only mode:
-#   ./run_jetclass2.sh ParT kin \
+#   ./run_jetclass2.sh RelativeParT kin \
 #       --weights /path/to/net_best_epoch_state.pt \
 #       [Weaver args...]
 #
 # Test-only using the default checkpoint for COMMENT:
-#   ./run_jetclass2.sh ParT kin --test-only [Weaver args...]
+#   ./run_jetclass2.sh RelativeParT kin --test-only [Weaver args...]
 # ---------------------------------------------------------------------------
 
 TRAIN_PERCENTAGE=100

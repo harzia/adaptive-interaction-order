@@ -9,8 +9,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from aio.core.geometry.relative_attention import frequency_ladder
-from aio.models.jets.angular_experiments import build_experiment
-from aio.models.jets.particle_transformer import pairwise_lv_fts_pp
+from aio.models.jets.relative_experiments import relative_config
+from aio.models.jets.particle_transformer import ParticleTransformer, pairwise_lv_fts_pp
 from aio.models.jets.relative_particle_transformer import geometry_coordinates
 
 
@@ -50,7 +50,7 @@ def compare(checkpoint, inputs, cap=128, seed=123):
         while k.startswith(("module.", "_orig_mod.", "mod.")):
             k = k.split(".", 1)[1]
         state[k] = val
-    model = build_experiment("part_d4").eval()
+    model = ParticleTransformer(input_dim=7, num_classes=188, **relative_config("part_pair_mlp64_d4")).eval()
     model.load_state_dict(state, strict=True)
     data = torch.load(inputs, map_location="cpu", weights_only=True)
     v, mask = data["vectors"].float(), data["mask"]
@@ -81,7 +81,7 @@ def compare(checkpoint, inputs, cap=128, seed=123):
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--checkpoint", type=Path, required=True)
-    p.add_argument("--inputs", type=Path, required=True, help="Tensor sample from export_representation_inputs.py")
+    p.add_argument("--inputs", type=Path, required=True, help="Tensor sample from export_relative_inputs.py")
     p.add_argument("--pairs-per-jet", type=int, default=128)
     p.add_argument("--seed", type=int, default=123)
     a = p.parse_args()

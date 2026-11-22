@@ -1,3 +1,0 @@
-# Optional hierarchy controls and offline plots; install the pilot requirements first.
-fastjet>=3.5.2.0
-matplotlib>=3.7

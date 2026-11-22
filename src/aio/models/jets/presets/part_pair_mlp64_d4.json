@@ -1,0 +1,8 @@
+{
+  "pair_embed_dims": [
+    64,
+    64,
+    64
+  ],
+  "num_layers": 4
+}

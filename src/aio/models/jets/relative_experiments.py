@@ -1,25 +1,37 @@
-"""Relative-attention experiment arms. All inherit the actual part_d4 recipe."""
-from .angular_experiments import experiment_config
+"""Load the matched JetClass-II model presets by their filenames."""
+import json
+from pathlib import Path
 
-PRESETS = {
-    "A": {},  # ordinary ParT
-    "B": {"pair_embed_dims": None},
-    "C8": {"pair_embed_dims": [8, 8, 8]},
-    "C": {"score": "linear", "rotate_values": False},
-    "H": {"score": "linear"},
-    "H_small": {"score": "linear", "value_bank": "small"},
-    "E": {"score": "rotary"},
-    "E_small": {"score": "rotary", "bank": "small"},
-    "D": {"score": "rotary", "rotate_values": False},
-    "F": {"score": "harmonic", "rotate_values": False},
-    "G": {"score": "low_rank", "rotate_values": False},
+PRESET_DIR = Path(__file__).with_name("presets")
+PRESETS = tuple(sorted(p.stem for p in PRESET_DIR.glob("*.json") if p.stem != "common"))
+DEFAULT_PRESET = "linear_pair_rotary_values15_d4"
+PILOT = ("linear_pair_plain_values_d4", DEFAULT_PRESET, "plain_transformer_d4",
+         "rotary_qk30_rotary_values15_d4")
+
+# The proposal labels continue to work in saved Weaver commands.
+LEGACY_NAMES = {
+    "A": "part_pair_mlp64_d4",
+    "B": "plain_transformer_d4",
+    "C8": "part_pair_mlp8_d4",
+    "C": "linear_pair_plain_values_d4",
+    "H": "linear_pair_rotary_values15_d4",
+    "H_small": "linear_pair_rotary_values6_d4",
+    "E": "rotary_qk30_rotary_values15_d4",
+    "E_small": "rotary_qk12_rotary_values6_d4",
+    "D": "rotary_qk30_plain_values_d4",
+    "F": "rest_harmonics_l2_plain_values_d4",
+    "G": "low_rank8_plain_values_d4"
 }
 
 
+def canonical_preset(name):
+    return LEGACY_NAMES.get(name, name)
+
+
 def relative_config(preset, **overrides):
-    if preset not in PRESETS:
+    name = canonical_preset(preset)
+    if name not in PRESETS:
         raise ValueError(f"Unknown preset {preset!r}. Choose one of {', '.join(PRESETS)}")
-    _, common = experiment_config("part_d4")
-    if "score" in PRESETS[preset]:
-        del common["pair_embed_dims"]
-    return {**common, **PRESETS[preset], **overrides}
+    common = json.loads((PRESET_DIR / "common.json").read_text())
+    config = json.loads((PRESET_DIR / f"{name}.json").read_text())
+    return {**common, **config, **overrides}

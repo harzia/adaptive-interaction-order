@@ -1,1 +1,1 @@
-"""Lorentz geometry and learned regional communication for representation-order studies."""
+"""Relative coordinates and harmonic features for particle attention."""

@@ -133,8 +133,4 @@ dmypy.json
 checkpoints/
 *.npy
 
-# Local routing experiment outputs and pytest work directories
-/routing-artifacts/
-/pytest-of-root/
-/pytest-of-agent/
-/angular-artifacts/
+/pytest-of-*/

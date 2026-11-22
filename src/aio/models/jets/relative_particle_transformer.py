@@ -5,7 +5,7 @@ import math
 import torch
 from torch.nn import functional as F
 
-from aio.core.geometry.angular_moments import jet_angular_geometry
+from aio.core.geometry.rest_harmonics import rest_harmonics
 from aio.core.geometry.relative_attention import RelativeAttention
 from .particle_transformer import ParticleTransformer, pairwise_lv_fts_pp
 
@@ -67,10 +67,7 @@ class RelativeParticleTransformer(ParticleTransformer):
             v = v.to(dtype)
             coords = geometry_coordinates(points.to(dtype), v).masked_fill(~mask.transpose(1, 2), 0)
             pair = pair_features(v, v, self.scale_invariant_pairs) if self.score == "linear" else None
-            harmonics = None
-            if self.score == "harmonic":
-                geometry = jet_angular_geometry(v, mask)
-                harmonics = torch.cat((geometry["direction"], geometry["quadrupole"]), -1)
+            harmonics = rest_harmonics(v, mask) if self.score == "harmonic" else None
         padding = ~mask[:, 0]
         # Preserve the baseline's finite wrap padding for its input BatchNorm.
         x = x.masked_fill(~mask & ~torch.isfinite(x), 0)

@@ -9,12 +9,13 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from aio.models.jets.relative_experiments import PRESETS
+from aio.models.jets.relative_experiments import PILOT, PRESETS, canonical_preset
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, epilog="Append Weaver options such as -o num_layers 2 or --weights FILE.")
-    p.add_argument("preset", choices=[*PRESETS, "suite"], help="suite runs C, H, B, E in order")
+    p.add_argument("preset", type=canonical_preset, choices=[*PRESETS, "suite"],
+                   help="suite runs " + ", ".join(PILOT) + " in order")
     p.add_argument("--seed", type=int, action="append", help="repeat for multiple seeds")
     p.add_argument("--num-epochs", type=int, default=os.getenv("EPOCHS", "80"))
     p.add_argument("--train-percentage", type=int, default=os.getenv("TRAIN_PERCENTAGE", "10"))
@@ -26,7 +27,7 @@ def main():
     seeds = args.seed or [int(os.getenv("SEED", "123"))]
     if min(seeds) < 0 or len(set(seeds)) != len(seeds) or args.num_epochs < 1 or not 1 <= args.train_percentage <= 100:
         p.error("Expected distinct nonnegative seeds, positive epochs, and a training percentage from 1 to 100")
-    presets = ["C", "H", "B", "E"] if args.preset == "suite" else [args.preset]
+    presets = PILOT if args.preset == "suite" else [args.preset]
     single = len(seeds) * len(presets) == 1
     if not single and os.getenv("COMMENT"):
         p.error("Unset COMMENT for multiple runs and use --comment-prefix to give each run its own directory")
