@@ -1,0 +1,1995 @@
+diff --git a/README.md b/README.md
+index 9421871..fbcaff8 100644
+--- a/README.md
++++ b/README.md
+@@ -8,3 +8,9 @@ python scripts/run_relative_experiment.py rotary_qk30_rotary_values15_d4
+ ```
+ 
+ The [model presets](src/aio/models/jets/presets) use the same names as the launcher and output directories. The [run guide](docs/relative_attention.md) lists the matched baselines and ablations, the original proposal labels, checkpoint evaluation, and profiling commands.
++
++The [frozen-embedding head test](docs/embedding_head_test.md) checks whether a trained tagger misses information that standard substructure observables carry, without retraining it:
++
++```bash
++CHECKPOINT=/path/to/net_best_epoch_state.pt ./scripts/run_embedding_head_test.sh
++```
+diff --git a/docs/embedding_head_test.md b/docs/embedding_head_test.md
+new file mode 100644
+index 0000000..dd414b1
+--- /dev/null
++++ b/docs/embedding_head_test.md
+@@ -0,0 +1,114 @@
++# Frozen-embedding head test
++
++**Question:** does a trained tagger fail to extract information that standard substructure observables carry? The test freezes the tagger, exports its class-token embedding, and trains a small head twice on jets the tagger never saw: once on the embedding alone and once on the embedding plus hand-computed observables. If the second head is no better, the embedding already contains what those observables say, and an architecture change that re-expresses the same information cannot help.
++
++No tagger is retrained. The noise is the spread between head seeds, on identical test jets for every arm, which is far smaller than the 4–9% seed spread of full training runs.
++
++## Run it
++
++Use the Weaver environment of the JetClass-II runs, with `DATA_PATH` and `OUTPUT_PATH` set as for `run_jetclass2.sh`.
++
++```bash
++export DATA_PATH=/path/to/datasets
++export OUTPUT_PATH=/path/to/runs
++export CHECKPOINT=/path/to/baseline/training/net_best_epoch_state.pt
++
++# 1. A short run on a handful of files, to check the setup. Its numbers mean nothing.
++QUICK=1 ./scripts/run_embedding_head_test.sh
++
++# 2. The full test.
++./scripts/run_embedding_head_test.sh
++```
++
++The defaults assume the default ParT (width 128, 8 heads, 8 blocks, as trained by `integrations/weaver/ParT.py` on `main`) trained on 10% of the files. For another model:
++
++```bash
++# A width-48 preset from this branch
++FULL_SIZE=0 PRESET=linear_pair_rotary_values15_d4 NAME=head_test_rotary ./scripts/run_embedding_head_test.sh
++
++# Anything that was passed to Weaver with -o
++EXTRACT_ARGS='--model-option num_layers=2' FULL_SIZE=0 PRESET=part_pair_mlp64_d4 ./scripts/run_embedding_head_test.sh
++```
++
++The checkpoint is loaded strictly, so a wrong size stops with the mismatched keys.
++
++## What the three steps do
++
++| Step | Script | Needs | Output |
++|---|---|---|---|
++| `extract` | `scripts/extract_embeddings.py` | GPU, Weaver | `shards/{train,val,test}/<file>.npz`: label, embedding, original logits, `jet_pt`, `jet_sdmass`, and the valid constituent four-momenta exactly as the model received them |
++| `observables` | `scripts/compute_jet_observables.py` | CPU cores, NumPy | `<file>.obs.npz` beside each shard, and `observables.json` with the column names |
++| `heads` | `scripts/train_embedding_head.py` | GPU | `heads/<arm>/seed<k>/metrics.json` from the repository's evaluator, and `heads/summary.json` |
++
++Every step skips work that is already done, so an interrupted run resumes when the script is started again. Run a subset with `STEPS="observables heads"`. Everything is written under `$OUTPUT_PATH/$NAME` (default `embedding_head_test`).
++
++**Files.** The head must be trained on jets the checkpoint never saw. A 10% run used `Res2P` 0–19, `Res34P` 0–85 and `QCD` 0–27, so the head trains on the same number of files from the middle of the training range (`Res2P` 100–119, `Res34P` 430–515, `QCD` 140–167), validates on the first validation files, and is scored on the usual test files. A random fraction of each file is kept: 20% / 15% / 12%, roughly 2M / 0.4M / 3M jets. Change the ranges with `HEAD_TRAIN_RES2P=START:END` and so on, and the fractions with `TRAIN_KEEP`, `VAL_KEEP`, `TEST_KEEP`. For a checkpoint trained on more than half the files, set `CHECKPOINT_TRAIN_PERCENTAGE`; the script then refuses the default ranges until you give ones the checkpoint did not use and set `ALLOW_OVERLAP=1`. A checkpoint trained on all training files leaves only the validation files to split between head training and head validation.
++
++**Reweighting.** Head-training jets are drawn with Weaver's flat pT × soft-drop-mass reweighting and class weights, as in tagger training. Without it the head could gain from mass and pT priors that the tagger was deliberately kept from learning, and that gain would be mistaken for missing substructure. The weights are taken from `REWEIGHT_YAML` if set, else from the `JetClassII_kin.<md5>.auto.yaml` that Weaver wrote beside the data config when the tagger trained, else rebuilt from the head-training shards with Weaver's method. The log line `flat reweighting: ...` says which.
++
++**Heads.** A two-layer MLP (1024, 1024, GELU, dropout 0.1), AdamW, 40 epochs with warm-up and cosine decay, three seeds. Each embedding arm is residual: its logits are the checkpoint's own logits plus a correction whose last layer starts at zero. Every arm therefore starts exactly at the checkpoint's performance, and the epoch with the best weighted validation loss is kept, so an arm that learns nothing reports exactly the checkpoint's numbers. Change settings with `HEAD_ARGS`, for example `HEAD_ARGS="--arms embedding embedding+all --seeds 0 1 2 3 4"`.
++
++## Arms
++
++| Arm | Inputs | Role |
++|---|---|---|
++| `parT_head` | none (the checkpoint's own logits) | Check. Must reproduce the checkpoint's known test metrics. |
++| `embedding` | embedding | **Reference.** What a larger head and fresh jets buy without new information. |
++| `embedding+<group>` | embedding and one observable group | Which kind of observable helps, if any. |
++| `embedding+all` | embedding and all 116 observables | **The answer**, read against `embedding`. |
++| `obs_only` | observables | Check that the observables carry signal. Trained from scratch. |
++
++## Read the result
++
++The script prints a table and saves it in `heads/summary.json`. The `embedding` row shows values. Every other row shows the relative change against it, averaged over seeds, with the spread across seeds after `±`. Differences are paired by seed.
++
++Columns: hadronic `rej50` geometric mean, the same for the 4-, 3- and 2-prong groups, `X_bb_vs_QCD_bb`, `X_bb_vs_X_cc`, top-1 accuracy, and `val_loss`, the weighted validation cross-entropy (lower is better). `summary.json` also has each hadronic group separately, `rej30`, the 1e-3 signal efficiency, and the remaining pairs.
++
++Before reading the answer, check three things:
++
++1. **`parT_head` matches the checkpoint.** Its `rej50_geomean_hadronic` (in `heads/parT_head/metrics.json`) should be within a few percent of the checkpoint's own test result; the test jets are a random subset of the same files. `extract` also prints the original head's top-1 accuracy per file. A large gap means the model options do not match the checkpoint.
++2. **`obs_only` is far above chance.** If not, the observables are broken.
++3. **`embedding` is close to `parT_head`.** A large gain here means the head itself was the limit, which is a finding of its own.
++
++Then compare `embedding+all` with `embedding`:
++
++- **No change beyond the seed spread, in rejection and in `val_loss`.** The embedding already holds what these observables carry. Subjet structure, N-subjettiness, energy correlators, pull and the primary Lund plane are not what ParT is missing.
++- **A clear gain, several times the seed spread.** ParT's output lacks information that is present in its inputs. The per-group arms and the per-class columns say which, and that is a specific target for an architecture change.
++- **A small gain, one or two times the spread.** Add seeds and head-training jets (`TRAIN_KEEP`) before concluding anything.
++
++`val_loss` is the most sensitive column, because it uses every validation jet instead of the tail that sets a rejection.
++
++## Limits of the test
++
++- **A null result covers these observables only.** It does not show that ParT extracts everything.
++- **A gain does not say where the information was lost.** It may be absent from the particle tokens or dropped by the class-attention readout. The next step would be the same test with pooled particle tokens as a third input.
++- **The head has finite data.** With 116 extra inputs it needs enough jets to find a small gain. The script prints the effective sample size after reweighting; `obs_only` and `val_loss` show whether the head is learning.
++- **Approximations in the observables.** The four-point correlator uses the 24 hardest constituents, and the generalised correlators behind `N2` and `N3` use the 32 and 16 hardest. They are still functions of the model's inputs.
++
++## The observables
++
++All 116 are computed from the scaled constituent four-momenta in `pf_vectors` (at most 128 particles, jet pT scaled to 500), which are exactly what the model receives. They add no information the tagger was not given, and none reveals the absolute jet pT. Angles use rapidity and azimuth; the radius is 0.8.
++
++| Group | Count | Contents |
++|---|---:|---|
++| `basic` | 9 | Multiplicity, mass, width, LHA, thrust, pTD, three leading momentum fractions |
++| `subjets` | 50 | Exclusive kT subjets for 2, 3 and 4 subjets: mass, momentum fraction and multiplicity of each, pairwise ΔR and mass, and the merge scales d12, d23, d34 |
++| `nsub` | 7 | τ1–τ4 (β = 1, exclusive-kT axes) and τ21, τ32, τ43 |
++| `ecf` | 16 | e2, e3, e4, C2, D2, C3, D3 for β = 1 and 2; N2 and N3 for β = 1 |
++| `pull` | 5 | Jet pull, and the pull magnitude and pull angle of the two leading kT subjets |
++| `lund` | 25 | (ΔR, kT, z) of the first six primary Cambridge/Aachen declusterings and of the hardest one, counts above three kT thresholds, number of primary emissions |
++| `softdrop` | 4 | Soft-drop (z > 0.1, β = 0) mass, zg, rg, and number of dropped branches |
++
++The code is `src/aio/analysis/jet_observables.py`, batched NumPy without FastJet. `tests/test_jet_observables.py` checks it against slow per-jet reference implementations and for invariance under permutation, padding, azimuthal rotation and longitudinal boost.
++
++## Cost
++
++Sizes scale with the keep fractions. These are estimates from the array sizes, not measurements: at the defaults, about 14 GB of shards on disk and about 16 GB of memory in the `heads` step. The `observables` step ran at about 600 jets per second per core on synthetic jets in development, which would be about 2.5 core-hours for 5.4M jets; set `WORKERS`. Lower `TEST_KEEP` first if memory is short.
++
++## Tests
++
++```bash
++PYTHONPATH=src:. python -m pytest tests/test_jet_observables.py tests/test_head_probe.py
++```
++
++These cover the observables, the reweighting, the feature scaling, and a full run on synthetic jets through the observable script, the head script with `--backend sklearn`, and the repository's evaluator. They need NumPy, PyYAML and scikit-learn, not PyTorch. The scikit-learn backend exists for this check only.
+diff --git a/scripts/compute_jet_observables.py b/scripts/compute_jet_observables.py
+new file mode 100755
+index 0000000..481ea6c
+--- /dev/null
++++ b/scripts/compute_jet_observables.py
+@@ -0,0 +1,75 @@
++#!/usr/bin/env python3
++"""Compute hand-made jet observables for exported shards (CPU, NumPy only).
++
++Reads the constituent four-momenta stored by extract_embeddings.py and writes a
++companion ``<shard>.obs.npz`` next to each shard, plus ``observables.json`` with
++the column names. Existing companions are skipped unless --overwrite is given.
++"""
++from __future__ import annotations
++
++import os
++
++# One BLAS thread per worker; the pool provides the parallelism.
++for _variable in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
++    os.environ.setdefault(_variable, "1")
++
++import argparse  # noqa: E402
++import json  # noqa: E402
++from multiprocessing import Pool  # noqa: E402
++from pathlib import Path  # noqa: E402
++import sys  # noqa: E402
++import time  # noqa: E402
++
++import numpy as np  # noqa: E402
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path[:0] = [str(ROOT / "src"), str(ROOT)]
++from aio.analysis import jet_observables  # noqa: E402
++from aio.analysis.head_probe import observable_path, shard_paths  # noqa: E402
++
++
++def process(job):
++    shard, chunk = job
++    start = time.time()
++    with np.load(shard) as data:
++        vectors, offsets = data["part_vectors"].astype(np.float64), data["part_offsets"]
++    values, names = jet_observables.compute(vectors, offsets, chunk=chunk)
++    target = observable_path(shard)
++    temporary = target.with_suffix(".tmp.npz")
++    np.savez(temporary, values=values)
++    os.replace(temporary, target)
++    return str(shard), len(values), time.time() - start, [list(n) for n in names]
++
++
++def main():
++    p = argparse.ArgumentParser(description=__doc__)
++    p.add_argument("directories", type=Path, nargs="+", help="Split directories written by extract_embeddings.py")
++    p.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
++    p.add_argument("--chunk", type=int, default=128, help="Jets per padded batch")
++    p.add_argument("--overwrite", action="store_true")
++    args = p.parse_args()
++    if args.workers < 1 or args.chunk < 1:
++        p.error("Expected positive workers and chunk")
++    jobs = []
++    for directory in args.directories:
++        shards = shard_paths(directory)
++        if not shards:
++            p.error(f"No shards in {directory}")
++        jobs += [(s, args.chunk) for s in shards if args.overwrite or not observable_path(s).is_file()]
++    # Column names do not depend on the data, so they can be written even when nothing is pending.
++    _, names = jet_observables.compute_batch(np.zeros((1, 1, 4)), np.zeros((1, 1), dtype=bool))
++    for directory in args.directories:
++        (directory / "observables.json").write_text(json.dumps([list(n) for n in names], indent=1))
++    print(f"{len(jobs)} shards to process with {args.workers} workers; {len(names)} observables", flush=True)
++    done, jets, start = 0, 0, time.time()
++    with Pool(args.workers) as pool:
++        for shard, count, seconds, shard_names in pool.imap_unordered(process, jobs):
++            if shard_names != [list(n) for n in names]:
++                raise RuntimeError(f"Observable columns changed while processing {shard}")
++            done, jets = done + 1, jets + count
++            print(f"[{done}/{len(jobs)}] {Path(shard).name}: {count} jets in {seconds:.0f}s "
++                  f"({jets / max(time.time() - start, 1e-9):.0f} jets/s overall)", flush=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/extract_embeddings.py b/scripts/extract_embeddings.py
+new file mode 100755
+index 0000000..fbdf7d0
+--- /dev/null
++++ b/scripts/extract_embeddings.py
+@@ -0,0 +1,192 @@
++#!/usr/bin/env python3
++"""Export class-token embeddings, logits and constituents from a trained tagger.
++
++Writes one shard per input file with Weaver's own preprocessing and no
++training reweighting. Each shard holds, per jet: the truth label, the frozen
++class-token embedding, the original logits, the scalar observers, and the valid
++constituent four-momenta exactly as the model received them. Files whose shard
++already exists are skipped, so an interrupted export can be resumed.
++
++Use held-out files for every split: files the checkpoint never trained on for
++``train`` and ``val``, and test files for ``test``.
++"""
++from __future__ import annotations
++
++import argparse
++import ast
++import hashlib
++import json
++import os
++from pathlib import Path
++import sys
++
++import numpy as np
++import torch
++from torch.utils.data import DataLoader
++from weaver.utils.dataset import SimpleIterDataset
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path[:0] = [str(ROOT / "src"), str(ROOT)]
++from integrations.weaver.RelativeParT import get_model  # noqa: E402
++
++# The Sophon-aligned ParT that integrations/weaver/ParT.py trained on main.
++FULL_SIZE_PART = dict(embed_dims=[128, 512, 128], num_heads=8, num_layers=8)
++
++
++def parse_option(text):
++    key, separator, value = text.partition("=")
++    if not key or not separator:
++        raise argparse.ArgumentTypeError(f"Expected KEY=VALUE, got {text!r}")
++    try:
++        return key, ast.literal_eval(value)
++    except (ValueError, SyntaxError):
++        return key, value
++
++
++def load_state(path):
++    payload = torch.load(path, map_location="cpu", weights_only=True)
++    state = {}
++    for key, value in payload.get("state_dict", payload).items():
++        while key.startswith(("module.", "_orig_mod.")):
++            key = key.split(".", 1)[1]
++        state[key] = value
++    if not any(key.startswith("mod.") for key in state):   # saved from the bare model
++        state = {"mod." + key: value for key, value in state.items()}
++    return state
++
++
++def open_file(path, group, args):
++    return SimpleIterDataset({group: [str(path)]}, str(args.data_config), for_training=False,
++                             fetch_by_files=True, fetch_step=1, async_load=False, name=f"probe_{group}")
++
++
++def split_group(text):
++    group, sep, path = text.partition(":")
++    return (group, Path(path)) if sep else (Path(text).stem.split("_")[0], Path(text))
++
++
++@torch.no_grad()
++def export_file(path, group, dataset, model, device, args, rng):
++    names = list(dataset.config.input_names)
++    loader = DataLoader(dataset, batch_size=args.batch_size, num_workers=0)
++    out = {k: [] for k in ("label", "embedding", "logits", "part_vectors", "counts")}
++    observers_out, seen, kept = {}, 0, 0
++    for inputs, labels, observers in loader:
++        size = len(labels[args.label])
++        seen += size
++        keep = torch.from_numpy(rng.random(size) < args.keep_fraction)
++        if args.max_jets_per_file is not None:
++            allowed = max(args.max_jets_per_file - kept, 0)
++            keep &= keep.cumsum(0) <= allowed
++        if not keep.any():
++            if args.max_jets_per_file is not None and kept >= args.max_jets_per_file:
++                break
++            continue
++        batch = [inputs[k][keep].to(device, non_blocking=True) for k in names]
++        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=args.amp):
++            output = model(*batch)
++        output = output.float().cpu()
++        if output.shape[1] <= args.num_classes:
++            raise RuntimeError("The model returned no embedding; export_embed must be enabled")
++        mask = inputs["pf_mask"][keep][:, 0] > 0
++        out["label"].append(labels[args.label][keep].numpy().astype(np.int16))
++        out["logits"].append(output[:, :args.num_classes].numpy())
++        out["embedding"].append(output[:, args.num_classes:].numpy())
++        out["part_vectors"].append(inputs["pf_vectors"][keep].transpose(1, 2)[mask].numpy().astype(np.float32))
++        out["counts"].append(mask.sum(1).numpy())
++        for key, value in observers.items():
++            if torch.is_tensor(value) and value.ndim == 1 and len(value) == size:
++                observers_out.setdefault(key, []).append(value[keep].numpy().astype(np.float32))
++        kept += int(keep.sum())
++    if not kept:
++        return None
++    arrays = {k: np.concatenate(v) for k, v in out.items()}
++    arrays["part_offsets"] = np.concatenate(([0], np.cumsum(arrays.pop("counts")))).astype(np.int64)
++    arrays.update({k: np.concatenate(v) for k, v in observers_out.items()})
++    for required in ("jet_pt", "jet_sdmass"):
++        if required not in arrays:
++            raise RuntimeError(f"Observer {required!r} is missing; the data config must list it under observers")
++    arrays["meta"] = np.array(json.dumps(dict(
++        source=str(path), group=group, split=args.split, seen=seen, kept=kept,
++        keep_fraction=args.keep_fraction, checkpoint=str(args.checkpoint), preset=args.preset,
++        model_options=args.resolved_options, data_config=str(args.data_config),
++        data_config_sha256=hashlib.sha256(args.data_config.read_bytes()).hexdigest())))
++    return arrays
++
++
++def main():
++    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    p.add_argument("--checkpoint", type=Path, required=True)
++    p.add_argument("--files", nargs="+", required=True,
++                   help="Input files, optionally GROUP:path as in Weaver (group defaults to the filename prefix)")
++    p.add_argument("--output-dir", type=Path, required=True, help="Root of the shard tree")
++    p.add_argument("--split", required=True, choices=("train", "val", "test"))
++    p.add_argument("--preset", default="part_pair_mlp64_d4")
++    p.add_argument("--full-size-part", action="store_true",
++                   help="Width 128, 8 heads, 8 blocks: the default ParT configuration")
++    p.add_argument("--model-option", type=parse_option, action="append", default=[], metavar="KEY=VALUE",
++                   help="Override a model argument, as Weaver's -o does")
++    p.add_argument("--data-config", type=Path, default=ROOT / "configs/datasets/jetclass2/JetClassII_kin.yaml")
++    p.add_argument("--num-classes", type=int, default=188)
++    p.add_argument("--label", default="truth_label")
++    p.add_argument("--keep-fraction", type=float, default=1.0, help="Random fraction of each file to export")
++    p.add_argument("--max-jets-per-file", type=int)
++    p.add_argument("--batch-size", type=int, default=512)
++    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
++    p.add_argument("--amp", action="store_true", help="bfloat16 autocast, as in training; off keeps float32")
++    p.add_argument("--seed", type=int, default=20261121)
++    p.add_argument("--overwrite", action="store_true")
++    args = p.parse_args()
++    if not 0 < args.keep_fraction <= 1 or args.batch_size < 1:
++        p.error("Expected 0 < keep-fraction <= 1 and a positive batch size")
++    files = [split_group(f) for f in args.files]
++    missing = [str(path) for _, path in files if not path.is_file()]
++    if missing or not args.checkpoint.is_file() or not args.data_config.is_file():
++        p.error("Missing checkpoint, data config or input files: " + ", ".join(missing[:5]))
++    options = dict(FULL_SIZE_PART if args.full_size_part else {}, **dict(args.model_option))
++    args.resolved_options = {k: repr(v) for k, v in options.items()}
++    out_dir = args.output_dir / args.split
++    out_dir.mkdir(parents=True, exist_ok=True)
++    device = torch.device(args.device)
++
++    model = None
++    total, correct = 0, 0
++    for index, (group, path) in enumerate(files):
++        target = out_dir / f"{path.stem}.npz"
++        if target.is_file() and not args.overwrite:
++            print(f"[{index + 1}/{len(files)}] {target.name} exists, skipping", flush=True)
++            continue
++        dataset = open_file(path, group, args)
++        if model is None:
++            model, _ = get_model(dataset.config, preset=args.preset, num_classes=args.num_classes,
++                                 export_embed=True, **options)
++            try:
++                model.load_state_dict(load_state(args.checkpoint), strict=True)
++            except RuntimeError as error:
++                raise SystemExit(
++                    f"The checkpoint does not fit preset {args.preset!r} with options {options}.\n"
++                    "Use --full-size-part for the default ParT (width 128, 8 heads, 8 blocks), the preset name\n"
++                    f"the checkpoint was trained with, and --model-option for anything passed with -o.\n\n{error}") from None
++            model = model.to(device).eval()
++            print(f"Loaded {args.checkpoint} into {type(model).__name__} "
++                  f"({sum(p.numel() for p in model.parameters()):,} parameters)", flush=True)
++        # One generator per file keeps the selection independent of which files were skipped.
++        digest = hashlib.sha256(f"{args.seed}:{path.name}".encode()).digest()
++        rng = np.random.default_rng(int.from_bytes(digest[:8], "little"))
++        arrays = export_file(path, group, dataset, model, device, args, rng)
++        if arrays is None:
++            print(f"[{index + 1}/{len(files)}] {path.name}: no jets selected", flush=True)
++            continue
++        temporary = target.with_suffix(".tmp.npz")
++        np.savez(temporary, **arrays)
++        os.replace(temporary, target)
++        hits = int((arrays["logits"].argmax(1) == arrays["label"]).sum())
++        total, correct = total + len(arrays["label"]), correct + hits
++        print(f"[{index + 1}/{len(files)}] {path.name}: {len(arrays['label'])} jets, "
++              f"top-1 {hits / len(arrays['label']):.4f}, embedding width {arrays['embedding'].shape[1]}", flush=True)
++    if total:
++        print(f"Exported {total} jets to {out_dir}; top-1 of the original head {correct / total:.4f}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/run_embedding_head_test.sh b/scripts/run_embedding_head_test.sh
+new file mode 100755
+index 0000000..e582392
+--- /dev/null
++++ b/scripts/run_embedding_head_test.sh
+@@ -0,0 +1,128 @@
++#!/bin/bash
++# Frozen-embedding head test: does a trained tagger miss information that
++# hand-made observables carry?  See docs/embedding_head_test.md.
++#
++#   CHECKPOINT=/path/net_best_epoch_state.pt ./scripts/run_embedding_head_test.sh
++#
++# Steps (all resumable; rerun to continue):
++#   extract      embeddings, logits and constituents from held-out files (GPU)
++#   observables  hand-made observables for every exported jet (CPU, parallel)
++#   heads        train and score the heads (GPU)
++#
++# QUICK=1 runs the whole chain on a handful of files in a few minutes, into
++# ${NAME}_quick, to check the setup before the full run. Its numbers mean nothing.
++set -euo pipefail
++
++: "${DATA_PATH:?Set DATA_PATH as for run_jetclass2.sh}"
++: "${OUTPUT_PATH:?Set OUTPUT_PATH as for run_jetclass2.sh}"
++: "${CHECKPOINT:?Set CHECKPOINT to the trained net_best_epoch_state.pt}"
++
++ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++cd "${ROOT}"
++export PYTHONPATH="${ROOT}/src:${ROOT}:${PYTHONPATH:-}"
++
++PYTHON=${PYTHON:-python}
++QUICK=${QUICK:-0}
++NAME=${NAME:-embedding_head_test}
++if [[ "${QUICK}" == 1 ]]; then
++    NAME="${NAME}_quick"
++    HEAD_TRAIN_RES2P=${HEAD_TRAIN_RES2P:-100:101}; HEAD_TRAIN_RES34P=${HEAD_TRAIN_RES34P:-430:433}
++    HEAD_TRAIN_QCD=${HEAD_TRAIN_QCD:-140:141}
++    HEAD_VAL_RES2P=${HEAD_VAL_RES2P:-200:200}; HEAD_VAL_RES34P=${HEAD_VAL_RES34P:-860:861}
++    HEAD_VAL_QCD=${HEAD_VAL_QCD:-280:280}
++    TEST_RES2P=${TEST_RES2P:-250:251}; TEST_RES34P=${TEST_RES34P:-1075:1078}; TEST_QCD=${TEST_QCD:-350:351}
++    TRAIN_KEEP=${TRAIN_KEEP:-0.1}; VAL_KEEP=${VAL_KEEP:-0.1}; TEST_KEEP=${TEST_KEEP:-0.1}
++    HEAD_ARGS=${HEAD_ARGS:-"--arms embedding embedding+all obs_only --seeds 0 --epochs 3"}
++fi
++OUT="${OUTPUT_PATH}/${NAME}"
++DATADIR="${DATA_PATH}/JetClass2/Pythia/data"
++STEPS=${STEPS:-"extract observables heads"}
++
++# Model. FULL_SIZE=1 is the default ParT (width 128, 8 heads, 8 blocks) trained by
++# integrations/weaver/ParT.py; FULL_SIZE=0 uses PRESET as it is.
++PRESET=${PRESET:-part_pair_mlp64_d4}
++FULL_SIZE=${FULL_SIZE:-1}
++DATA_CONFIG=${DATA_CONFIG:-configs/datasets/jetclass2/JetClassII_kin.yaml}
++
++# Files, as inclusive index ranges. The head must be trained on jets the
++# checkpoint never saw. A 10% run used Res2P 0-19, Res34P 0-85 and QCD 0-27, so
++# the defaults below take the same number of files from the middle of the
++# training range. Change them if the checkpoint used more than half the files.
++CHECKPOINT_TRAIN_PERCENTAGE=${CHECKPOINT_TRAIN_PERCENTAGE:-10}
++HEAD_TRAIN_RES2P=${HEAD_TRAIN_RES2P:-100:119}
++HEAD_TRAIN_RES34P=${HEAD_TRAIN_RES34P:-430:515}
++HEAD_TRAIN_QCD=${HEAD_TRAIN_QCD:-140:167}
++HEAD_VAL_RES2P=${HEAD_VAL_RES2P:-200:204}
++HEAD_VAL_RES34P=${HEAD_VAL_RES34P:-860:880}
++HEAD_VAL_QCD=${HEAD_VAL_QCD:-280:286}
++TEST_RES2P=${TEST_RES2P:-250:299}
++TEST_RES34P=${TEST_RES34P:-1075:1289}
++TEST_QCD=${TEST_QCD:-350:419}
++
++# Random fraction of each file to export (about 2M / 0.4M / 3M jets by default).
++TRAIN_KEEP=${TRAIN_KEEP:-0.20}
++VAL_KEEP=${VAL_KEEP:-0.15}
++TEST_KEEP=${TEST_KEEP:-0.12}
++
++BATCH_SIZE=${BATCH_SIZE:-512}
++WORKERS=${WORKERS:-$(( $(nproc) > 1 ? $(nproc) - 1 : 1 ))}
++EXTRACT_ARGS=${EXTRACT_ARGS:-}      # e.g. "--amp" or "--model-option num_layers=4"
++HEAD_ARGS=${HEAD_ARGS:-}            # e.g. "--arms embedding embedding+all --seeds 0 1 2"
++REWEIGHT_YAML=${REWEIGHT_YAML:-}    # the training run's *.auto.yaml, to reuse its exact weights
++
++if (( CHECKPOINT_TRAIN_PERCENTAGE > 50 )) && [[ -z "${ALLOW_OVERLAP:-}" ]]; then
++    echo "The default head-training files overlap a checkpoint trained on more than 50% of the data." >&2
++    echo "Set HEAD_TRAIN_* to files the checkpoint never saw, then ALLOW_OVERLAP=1." >&2
++    exit 2
++fi
++
++range_files() {   # range_files PREFIX START:END -> GROUP:path arguments
++    local prefix=$1 start=${2%%:*} end=${2##*:} i idx
++    for (( i=start; i<=end; i++ )); do
++        printf -v idx '%04d' "${i}"
++        printf '%s:%s/%s_%s.parquet\n' "${prefix}" "${DATADIR}" "${prefix}" "${idx}"
++    done
++}
++
++extract_split() {   # extract_split SPLIT KEEP RES2P RES34P QCD
++    local split=$1 keep=$2
++    local files=()
++    mapfile -t files < <(range_files Res2P "$3"; range_files Res34P "$4"; range_files QCD "$5")
++    local model=(--preset "${PRESET}")
++    [[ "${FULL_SIZE}" == 1 ]] && model+=(--full-size-part)
++    echo "---- extract ${split}: ${#files[@]} files, keep fraction ${keep}"
++    # shellcheck disable=SC2086
++    "${PYTHON}" scripts/extract_embeddings.py \
++        --checkpoint "${CHECKPOINT}" --data-config "${DATA_CONFIG}" "${model[@]}" \
++        --split "${split}" --keep-fraction "${keep}" --batch-size "${BATCH_SIZE}" \
++        --output-dir "${OUT}/shards" --files "${files[@]}" ${EXTRACT_ARGS}
++}
++
++echo "Output: ${OUT}"
++echo "Steps:  ${STEPS}"
++mkdir -p "${OUT}"
++
++for step in ${STEPS}; do
++    case "${step}" in
++        extract)
++            extract_split train "${TRAIN_KEEP}" "${HEAD_TRAIN_RES2P}" "${HEAD_TRAIN_RES34P}" "${HEAD_TRAIN_QCD}"
++            extract_split val   "${VAL_KEEP}"   "${HEAD_VAL_RES2P}"   "${HEAD_VAL_RES34P}"   "${HEAD_VAL_QCD}"
++            extract_split test  "${TEST_KEEP}"  "${TEST_RES2P}"       "${TEST_RES34P}"       "${TEST_QCD}"
++            ;;
++        observables)
++            "${PYTHON}" scripts/compute_jet_observables.py \
++                "${OUT}/shards/train" "${OUT}/shards/val" "${OUT}/shards/test" --workers "${WORKERS}"
++            ;;
++        heads)
++            reweight=()
++            [[ -n "${REWEIGHT_YAML}" ]] && reweight=(--reweight-yaml "${REWEIGHT_YAML}")
++            # shellcheck disable=SC2086
++            "${PYTHON}" scripts/train_embedding_head.py --shards "${OUT}/shards" --output "${OUT}/heads" \
++                --data-config "${DATA_CONFIG}" "${reweight[@]}" ${HEAD_ARGS}
++            ;;
++        *)
++            echo "Unknown step ${step}; choose from: extract observables heads" >&2
++            exit 2
++            ;;
++    esac
++done
+diff --git a/scripts/train_embedding_head.py b/scripts/train_embedding_head.py
+new file mode 100755
+index 0000000..6e590b2
+--- /dev/null
++++ b/scripts/train_embedding_head.py
+@@ -0,0 +1,316 @@
++#!/usr/bin/env python3
++"""Does a frozen tagger embedding miss information that hand-made observables carry?
++
++Trains a small head on held-out jets for several arms and scores each on the
++test shards with the repository's JetClass-II evaluator:
++
++  parT_head             the checkpoint's own head (no training; the reference level)
++  embedding             a new head on the frozen class-token embedding
++  embedding+<group>     the same head, also given one group of observables
++  embedding+all         the same head, given every observable
++  obs_only              observables alone, as a check that they carry signal
++
++By default every embedding arm is residual: its logits are the checkpoint's own
++logits plus a correction that starts at zero. Each arm therefore starts exactly
++at parT_head, and only a real gain can move it.
++
++Training jets are drawn with Weaver's flat pT x soft-drop-mass reweighting, so
++the head sees the distribution the tagger was trained on. Without this the head
++could gain from mass and pT priors the tagger was deliberately kept blind to.
++The weights come from --reweight-yaml, else from the auto.yaml Weaver left beside
++the data config, else they are rebuilt from the train shards.
++"""
++from __future__ import annotations
++
++import os
++
++# Only the sampled 188-way AUC uses this; the rejections do not.
++os.environ.setdefault("JETCLASS2_EVAL_AUC_SAMPLES_PER_CLASS", "200")
++
++import argparse  # noqa: E402
++import json  # noqa: E402
++import math  # noqa: E402
++from pathlib import Path  # noqa: E402
++import sys  # noqa: E402
++import time  # noqa: E402
++from types import SimpleNamespace  # noqa: E402
++
++import numpy as np  # noqa: E402
++import yaml  # noqa: E402
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path[:0] = [str(ROOT / "src"), str(ROOT)]
++from aio.analysis import head_probe as hp  # noqa: E402
++from aio.analysis.jet_observables import GROUPS  # noqa: E402
++
++REFERENCE = "embedding"
++
++
++def parse_arm(name, groups):
++    """Return (uses_embedding, observable_groups)."""
++    if name == "obs_only":
++        return False, tuple(groups)
++    head, *extra = name.split("+")
++    if head != "embedding":
++        raise ValueError(f"Unknown arm {name!r}")
++    if extra == ["all"]:
++        return True, tuple(groups)
++    unknown = set(extra) - set(groups)
++    if unknown:
++        raise ValueError(f"Arm {name!r} names unknown groups {sorted(unknown)}; available: {list(groups)}")
++    return True, tuple(extra)
++
++
++# ----------------------------------------------------------------------------- torch backend
++def fit_torch(train, val, test, args, seed, residual):
++    import torch
++    from torch.nn import functional as F
++
++    torch.manual_seed(seed)
++    rng = np.random.default_rng(seed)
++    device = torch.device(args.device)
++    classes = args.num_classes
++
++    class Head(torch.nn.Module):
++        def __init__(self, width):
++            super().__init__()
++            layers = []
++            for hidden in args.hidden:
++                layers += [torch.nn.Linear(width, hidden), torch.nn.GELU(), torch.nn.Dropout(args.dropout)]
++                width = hidden
++            self.body = torch.nn.Sequential(*layers)
++            self.out = torch.nn.Linear(width, classes)
++            if residual:   # start exactly at the checkpoint's own logits
++                torch.nn.init.zeros_(self.out.weight)
++                torch.nn.init.zeros_(self.out.bias)
++
++        def forward(self, x, base=None):
++            y = self.out(self.body(x))
++            return y if base is None else y + base
++
++    def tensors(split):
++        return (torch.from_numpy(split.x), torch.from_numpy(split.y.astype(np.int64)),
++                torch.from_numpy(split.base) if residual else None)
++
++    xtr, ytr, btr = tensors(train)
++    xva, yva, bva = tensors(val)
++    xte, _, bte = tensors(test)
++    wva = torch.from_numpy(val.w.astype(np.float32))
++    model = Head(xtr.shape[1]).to(device)
++    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
++    batch = min(args.batch_size, len(ytr))
++    steps = max(1, math.ceil(train.samples_per_epoch / batch))
++    total_steps = args.epochs * steps
++    warmup = max(1, total_steps // 10)
++
++    def learning_rate_factor(step):   # linear warm-up, then cosine decay
++        if step < warmup:
++            return (step + 1) / warmup
++        return 0.5 * (1.0 + math.cos(math.pi * (step - warmup) / max(1, total_steps - warmup)))
++
++    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, learning_rate_factor)
++    probability = train.w / train.w.sum()
++
++    def forward(x, base, index):
++        b = None if base is None else base[index].to(device, non_blocking=True)
++        return model(x[index].to(device, non_blocking=True), b)
++
++    @torch.no_grad()
++    def validation_loss():
++        model.eval()
++        total, weight = 0.0, 0.0
++        for start in range(0, len(yva), args.eval_batch):
++            index = slice(start, start + args.eval_batch)
++            loss = F.cross_entropy(forward(xva, bva, index), yva[index].to(device), reduction="none")
++            w = wva[index].to(device)
++            total, weight = total + float((loss * w).sum()), weight + float(w.sum())
++        return total / max(weight, 1e-12)
++
++    best_loss, best_state, best_epoch = validation_loss(), None, -1
++    initial = best_loss
++    best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
++    for epoch in range(args.epochs):
++        model.train()
++        order = torch.from_numpy(rng.choice(len(probability), size=steps * batch, p=probability))
++        for step in range(steps):
++            index = order[step * batch:(step + 1) * batch]
++            loss = F.cross_entropy(forward(xtr, btr, index), ytr[index].to(device))
++            optimizer.zero_grad(set_to_none=True)
++            loss.backward()
++            optimizer.step()
++            scheduler.step()
++        current = validation_loss()
++        if current < best_loss:
++            best_loss, best_epoch = current, epoch
++            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
++    model.load_state_dict(best_state)
++    model.eval()
++
++    def predict():
++        for start in range(0, len(test.y), args.eval_batch):
++            index = slice(start, start + args.eval_batch)
++            with torch.no_grad():
++                probabilities = forward(xte, bte, index).float().softmax(1).cpu().numpy()
++            yield test.y[index], probabilities
++
++    return predict(), dict(val_loss_initial=initial, val_loss_best=best_loss, best_epoch=best_epoch)
++
++
++# ----------------------------------------------------------------------------- sklearn backend
++def fit_sklearn(train, val, test, args, seed, residual):
++    """CPU smoke-test backend. It ignores the residual option and is not for results."""
++    from sklearn.neural_network import MLPClassifier
++
++    rng = np.random.default_rng(seed)
++    size = int(min(max(train.samples_per_epoch, 1), args.sklearn_samples))
++    index = rng.choice(len(train.y), size=size, p=train.w / train.w.sum())
++    model = MLPClassifier(hidden_layer_sizes=tuple(args.hidden), max_iter=args.epochs,
++                          batch_size=min(args.batch_size, size), learning_rate_init=args.lr, random_state=seed)
++    model.fit(train.x[index], train.y[index])
++
++    def predict():
++        for start in range(0, len(test.y), args.eval_batch):
++            index = slice(start, start + args.eval_batch)
++            probabilities = np.zeros((len(test.y[index]), args.num_classes), dtype=np.float32)
++            probabilities[:, model.classes_] = model.predict_proba(test.x[index])
++            yield test.y[index], probabilities
++
++    return predict(), dict(val_loss_initial=None, val_loss_best=None, best_epoch=None)
++
++
++# ----------------------------------------------------------------------------- driver
++def main():
++    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    p.add_argument("--shards", type=Path, required=True, help="Directory with train/, val/ and test/ shards")
++    p.add_argument("--output", type=Path, required=True)
++    p.add_argument("--data-config", type=Path, default=ROOT / "configs/datasets/jetclass2/JetClassII_kin.yaml")
++    p.add_argument("--reweight-yaml", type=Path,
++                   help="Weaver *.auto.yaml from the training run (default: the one beside the data config, if any)")
++    p.add_argument("--rebuild-reweight", action="store_true",
++                   help="Ignore any auto.yaml and rebuild the flat weights from the train shards")
++    p.add_argument("--arms", nargs="+", help="Default: embedding, one arm per observable group, embedding+all, obs_only")
++    p.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
++    p.add_argument("--no-residual", dest="residual", action="store_false",
++                   help="Train heads from scratch instead of as a correction to the checkpoint's logits")
++    p.add_argument("--hidden", type=int, nargs="*", default=[1024, 1024])
++    p.add_argument("--dropout", type=float, default=0.1)
++    p.add_argument("--epochs", type=int, default=40)
++    p.add_argument("--samples-per-epoch", type=int, help="Default: the effective sample size of the weighted train split")
++    p.add_argument("--batch-size", type=int, default=4096)
++    p.add_argument("--eval-batch", type=int, default=65536)
++    p.add_argument("--lr", type=float, default=1e-3)
++    p.add_argument("--weight-decay", type=float, default=0.01)
++    p.add_argument("--num-classes", type=int, default=188)
++    p.add_argument("--backend", choices=("torch", "sklearn"), default="torch")
++    p.add_argument("--sklearn-samples", type=int, default=200_000)
++    p.add_argument("--device", default=None, help="Default: cuda if available")
++    args = p.parse_args()
++    if args.backend == "torch":
++        import torch
++        args.device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
++    if len(set(args.seeds)) != len(args.seeds) or min(args.epochs, args.batch_size, args.eval_batch) < 1:
++        p.error("Expected distinct seeds and positive epochs and batch sizes")
++
++    config = yaml.safe_load(args.data_config.read_text())
++    names = hp.load_observable_names(args.shards / "train")
++    for split in ("val", "test"):
++        if hp.load_observable_names(args.shards / split) != names:
++            p.error(f"{split} observables do not match train; rerun compute_jet_observables.py on all splits")
++    groups = [g for g in GROUPS if any(g == group for group, _, _ in names)]
++    arm_names = args.arms or (["embedding"] + [f"embedding+{g}" for g in groups] + ["embedding+all", "obs_only"])
++    if REFERENCE not in arm_names:
++        arm_names = [REFERENCE] + arm_names
++    arms = {name: parse_arm(name, groups) for name in arm_names}
++
++    data = {split: hp.load_split(args.shards / split) for split in ("train", "val", "test")}
++    for split, d in data.items():
++        print(f"{split}: {len(d['label'])} jets, embedding width {d['embedding'].shape[1]}, "
++              f"{d['obs'].shape[1]} observables", flush=True)
++    membership = {s: hp.class_membership(data[s]["label"].astype(np.int64), config) for s in ("train", "val")}
++    source = None if args.rebuild_reweight else (args.reweight_yaml or hp.weaver_auto_yaml(args.data_config))
++    try:
++        hists = hp.load_reweight_hists(source) if source else None
++    except ValueError:
++        if args.reweight_yaml:
++            raise
++        hists = None          # an auto.yaml without histograms: fall back to rebuilding
++    if hists is None:
++        source = "rebuilt from the train shards"
++        hists = hp.flat_reweight_hists(membership["train"], data["train"]["jet_pt"], data["train"]["jet_sdmass"], config)
++    args.reweight_source = str(source)
++    print(f"flat reweighting: {source}", flush=True)
++    weights = {s: hp.event_weights(membership[s], data[s]["jet_pt"], data[s]["jet_sdmass"], hists, config)
++               for s in ("train", "val")}
++    ess = hp.effective_sample_size(weights["train"])
++    samples_per_epoch = int(args.samples_per_epoch or max(ess, 1))
++    print(f"train weights: mean {weights['train'].mean():.4f}, effective sample size {ess:.0f}; "
++          f"{samples_per_epoch} samples per epoch", flush=True)
++    if min(weights["train"].sum(), weights["val"].sum()) <= 0:
++        p.error("All sampling weights are zero; check the reweighting inputs")
++
++    args.output.mkdir(parents=True, exist_ok=True)
++    kwargs = dict(data_config=str(args.data_config))
++    labels = {s: data[s]["label"].astype(np.int64) for s in data}
++
++    def chunks_from(probabilities):
++        for start in range(0, len(labels["test"]), args.eval_batch):
++            yield labels["test"][start:start + args.eval_batch], probabilities(slice(start, start + args.eval_batch))
++
++    start = time.time()
++    reference_metrics = hp.evaluate_chunks(chunks_from(lambda index: hp.softmax(data["test"]["logits"][index])),
++                                           args.output / "parT_head", network_config="parT_head", **kwargs)
++    results = {"parT_head": [hp.summarise(reference_metrics)]}
++    # Weighted validation cross-entropy of the checkpoint's own logits: where every residual head starts.
++    results["parT_head"][0]["val_loss"] = hp.weighted_cross_entropy(data["val"]["logits"], labels["val"], weights["val"])
++    print(f"parT_head: hadronic rej50 {results['parT_head'][0]['rej50_geomean_hadronic']:.3f} "
++          f"({time.time() - start:.0f}s)", flush=True)
++
++    embedding_scaler = hp.FeatureScaler(np.zeros(data["train"]["embedding"].shape[1], dtype=bool))
++    embedding_scaler.fit(data["train"]["embedding"], weights["train"])
++    observable_scaler = hp.FeatureScaler([log for _, _, log in names]).fit(data["train"]["obs"], weights["train"])
++    scaled, bases = {}, {}
++    for s, d in data.items():   # keep one scaled copy and the logits; drop the raw features
++        scaled[s] = (embedding_scaler.transform(d.pop("embedding")), observable_scaler.transform(d.pop("obs")))
++        bases[s] = np.ascontiguousarray(d.pop("logits"), dtype=np.float32)
++    fit = fit_torch if args.backend == "torch" else fit_sklearn
++    training = {}
++    for name, (uses_embedding, arm_groups) in arms.items():
++        columns = hp.select_columns(names, arm_groups) if arm_groups else np.zeros(len(names), dtype=bool)
++        residual = args.residual and uses_embedding
++
++        def split(s):
++            parts = ([scaled[s][0]] if uses_embedding else []) + ([scaled[s][1][:, columns]] if columns.any() else [])
++            return SimpleNamespace(x=np.ascontiguousarray(np.concatenate(parts, 1)), y=labels[s],
++                                   base=bases[s], w=weights.get(s), samples_per_epoch=samples_per_epoch)
++
++        train, val, test = split("train"), split("val"), split("test")
++        results[name], training[name] = [], []
++        for seed in args.seeds:
++            start = time.time()
++            predictions, info = fit(train, val, test, args, seed, residual)
++            metrics = hp.evaluate_chunks(predictions, args.output / name / f"seed{seed}",
++                                         network_config=f"head:{name}", seed=seed, **kwargs)
++            results[name].append(dict(hp.summarise(metrics), val_loss=info["val_loss_best"]))
++            training[name].append(info)
++            progress = "" if info["val_loss_best"] is None else (
++                f", val loss {info['val_loss_initial']:.4f} -> {info['val_loss_best']:.4f}"
++                + (" (never improved)" if info["best_epoch"] < 0 else f" at epoch {info['best_epoch'] + 1}"))
++            print(f"{name} seed {seed}: hadronic rej50 {results[name][-1]['rej50_geomean_hadronic']:.3f}, "
++                  f"{train.x.shape[1]} inputs{progress} ({time.time() - start:.0f}s)", flush=True)
++        del predictions
++        train = val = test = None      # release this arm's arrays before building the next
++
++    table = hp.compare(results, REFERENCE)
++    summary = dict(reference=REFERENCE, table=table, runs=results, training=training,
++                   settings={k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
++                   sample=dict(train=len(labels["train"]), val=len(labels["val"]), test=len(labels["test"]),
++                               train_effective_sample_size=ess, observables=[list(n) for n in names]))
++    (args.output / "summary.json").write_text(json.dumps(summary, indent=1))
++    print("\nReference row shows values; other rows show the relative change against it, "
++          "with the spread across seeds.\nval_loss is the weighted validation cross-entropy (lower is better).\n")
++    print(hp.format_table(table, REFERENCE))
++    print(f"\nSaved {args.output / 'summary.json'}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/aio/analysis/__init__.py b/src/aio/analysis/__init__.py
+new file mode 100644
+index 0000000..2ff7b68
+--- /dev/null
++++ b/src/aio/analysis/__init__.py
+@@ -0,0 +1 @@
++"""Diagnostics that run on frozen model outputs."""
+diff --git a/src/aio/analysis/head_probe.py b/src/aio/analysis/head_probe.py
+new file mode 100644
+index 0000000..9d82cc3
+--- /dev/null
++++ b/src/aio/analysis/head_probe.py
+@@ -0,0 +1,298 @@
++"""Shared pieces of the frozen-embedding head test (NumPy only).
++
++The test asks whether hand-computed observables add information to a trained
++tagger's class-token embedding. A small head is trained twice on held-out jets,
++once with the embedding alone and once with the embedding plus observables, and
++both are scored with the repository's JetClass-II evaluator.
++"""
++from __future__ import annotations
++
++import json
++from pathlib import Path
++from types import SimpleNamespace
++
++import numpy as np
++
++LOG_FLOOR_MARGIN = 1.0
++CLIP = 8.0
++SUMMARY_KEYS = ("rej50_geomean_hadronic", "rej30_geomean_hadronic", "accuracy_top1",
++                "sig_eff_at_epsb1e-3_macro_hadronic", "auc_group_vs_qcd_macro_hadronic")
++HADRONIC = ("X_QQ", "X_gg", "X_YY_QQQQ", "X_YY_QQgg", "X_YY_gggg",
++            "X_YY_QQQ", "X_YY_QQg", "X_YY_Qgg", "X_YY_ggg")
++FOUR_PRONG, THREE_PRONG, TWO_PRONG = HADRONIC[2:5], HADRONIC[5:], HADRONIC[:2]
++PAIRS = ("X_bb_vs_QCD_bb", "X_qq_vs_X_gg", "X_YY_qqqq_vs_X_YY_gggg", "X_bb_vs_X_cc")
++
++
++# ----------------------------------------------------------------------------- shards
++def shard_paths(directory):
++    """Jet shards in a split directory, without observable companions or unfinished writes."""
++    return sorted(p for p in Path(directory).glob("*.npz")
++                  if not p.name.endswith((".obs.npz", ".tmp.npz")))
++
++
++def observable_path(shard):
++    return Path(shard).with_suffix("").with_suffix(".obs.npz")
++
++
++def load_split(directory, keys=("label", "embedding", "logits", "jet_pt", "jet_sdmass"), observables=True):
++    """Concatenate a split's shards. Returns a dict of arrays, plus ``obs`` if requested."""
++    paths = shard_paths(directory)
++    if not paths:
++        raise FileNotFoundError(f"No shards in {directory}")
++    parts = {k: [] for k in keys}
++    obs = []
++    for path in paths:
++        with np.load(path) as data:
++            for k in keys:
++                parts[k].append(data[k])
++        if observables:
++            companion = observable_path(path)
++            if not companion.is_file():
++                raise FileNotFoundError(f"Missing {companion}; run compute_jet_observables.py first")
++            with np.load(companion) as data:
++                obs.append(data["values"])
++            if len(obs[-1]) != len(parts[keys[0]][-1]):
++                raise ValueError(f"{companion} does not match its shard")
++    out = {k: np.concatenate(v) for k, v in parts.items()}
++    if observables:
++        out["obs"] = np.concatenate(obs)
++    return out
++
++
++def load_observable_names(directory):
++    """List of (group, name, log_scale) written by compute_jet_observables.py."""
++    return [tuple(row) for row in json.loads((Path(directory) / "observables.json").read_text())]
++
++
++# ----------------------------------------------------------------------------- reweighting
++def class_membership(labels, config):
++    """Index of each jet's reweighting class, from the data config's label expressions."""
++    weights = config["weights"]
++    index = np.full(len(labels), -1)
++    for c, name in enumerate(weights["reweight_classes"]):
++        expression = config["new_variables"][name]
++        member = eval(compile(expression, name, "eval"), {"__builtins__": {}}, {"jet_label": labels, "np": np})
++        index[np.asarray(member, dtype=bool)] = c
++    return index
++
++
++def flat_reweight_hists(class_index, x, y, config, max_weight=0.9):
++    """Weaver's ``reweight_method: flat`` histograms, built from the given jets."""
++    weights = config["weights"]
++    (_, x_bins), (_, y_bins) = weights["reweight_vars"].items()
++    threshold = weights.get("reweight_threshold", 10)
++    raw, result, events = {}, {}, {}
++    for c, (name, class_weight) in enumerate(zip(weights["reweight_classes"], weights["class_weights"])):
++        member = class_index == c
++        hist = np.histogram2d(x[member], y[member], bins=(x_bins, y_bins))[0].astype(np.float32)
++        raw[name] = hist
++        if not (hist > 0).any():
++            result[name], events[name] = np.zeros_like(hist), None
++            continue
++        populated = hist[hist > np.median(hist[hist > 0]) * 0.01]
++        reference = np.percentile(populated, threshold)
++        with np.errstate(divide="ignore"):
++            result[name] = np.clip(np.nan_to_num(reference / hist, posinf=0), 0, 1)
++        events[name] = float((hist * result[name]).sum()) / class_weight
++    present = [v for v in events.values() if v]
++    if not present:
++        raise ValueError("No jets fall in any reweighting class and bin")
++    smallest = min(present) * max_weight
++    return {name: result[name] * (smallest / events[name] if events[name] else 0.0) for name in result}
++
++
++def weaver_auto_yaml(data_config):
++    """The ``<name>.<md5>.auto.yaml`` Weaver writes beside a data config when it trains, if present."""
++    import hashlib
++    data_config = Path(data_config)
++    digest = hashlib.md5(data_config.read_bytes()).hexdigest()
++    candidate = data_config.with_name(f"{data_config.stem}.{digest}.auto.yaml")
++    return candidate if candidate.is_file() else None
++
++
++def load_reweight_hists(path):
++    """Histograms from a Weaver auto-generated YAML, to reproduce a training run exactly."""
++    import yaml
++    hists = (yaml.safe_load(Path(path).read_text()).get("weights") or {}).get("reweight_hists")
++    if not hists:
++        raise ValueError(f"{path} has no weights.reweight_hists; pass the training run's *.auto.yaml")
++    return {name: np.asarray(h, dtype=np.float32) for name, h in hists.items()}
++
++
++def event_weights(class_index, x, y, hists, config):
++    """Per-jet sampling weight, as Weaver's ``_build_weights`` computes it."""
++    weights = config["weights"]
++    (_, x_bins), (_, y_bins) = weights["reweight_vars"].items()
++    ix = np.clip(np.digitize(x, x_bins) - 1, 0, len(x_bins) - 2)
++    iy = np.clip(np.digitize(y, y_bins) - 1, 0, len(y_bins) - 2)
++    out = np.zeros(len(x), dtype=np.float64)
++    for c, name in enumerate(weights["reweight_classes"]):
++        member = class_index == c
++        out[member] = np.asarray(hists[name])[ix[member], iy[member]]
++    if weights.get("reweight_discard_under_overflow", True):
++        out[(x < min(x_bins)) | (x > max(x_bins)) | (y < min(y_bins)) | (y > max(y_bins))] = 0.0
++    return out
++
++
++def effective_sample_size(w):
++    total = w.sum()
++    return float(total * total / (w * w).sum()) if total > 0 else 0.0
++
++
++# ----------------------------------------------------------------------------- features
++class FeatureScaler:
++    """Log the heavy-tailed columns, then standardise and clip. Fitted on the training split.
++
++    Works through the rows in blocks, so it never holds a float64 copy of a whole split.
++    """
++
++    def __init__(self, log_columns, block=200_000):
++        self.log_columns = np.asarray(log_columns, dtype=bool)
++        self.block = block
++
++    def _blocks(self, x):
++        for start in range(0, len(x), self.block):
++            yield slice(start, start + self.block)
++
++    def _log(self, x):
++        x = np.array(x, dtype=np.float64)
++        cols = self.log_columns
++        positive = x[:, cols] > 0
++        x[:, cols] = np.where(positive, np.log(np.where(positive, x[:, cols], 1.0)), self.floor)
++        return x
++
++    def fit(self, x, weights=None):
++        cols = self.log_columns
++        lowest = np.full(int(cols.sum()), np.inf)
++        for rows in self._blocks(x):
++            part = x[rows][:, cols]
++            lowest = np.minimum(lowest, np.where(part > 0, part, np.inf).min(0, initial=np.inf))
++        found = np.isfinite(lowest)
++        self.floor = np.where(found, np.log(np.where(found, lowest, 1.0)), 0.0) - LOG_FLOOR_MARGIN
++        w = np.ones(len(x)) if weights is None else np.asarray(weights, dtype=np.float64)
++        total = w.sum()
++        self.mean = sum((w[rows, None] * self._log(x[rows])).sum(0) for rows in self._blocks(x)) / total
++        variance = sum((w[rows, None] * (self._log(x[rows]) - self.mean) ** 2).sum(0)
++                       for rows in self._blocks(x)) / total
++        self.scale = np.sqrt(variance)
++        self.scale[self.scale < 1e-12] = 1.0
++        return self
++
++    def transform(self, x):
++        out = np.empty(x.shape, dtype=np.float32)
++        for rows in self._blocks(x):
++            out[rows] = np.clip((self._log(x[rows]) - self.mean) / self.scale, -CLIP, CLIP)
++        return out
++
++
++def select_columns(names, groups):
++    """Boolean column mask for the requested observable groups."""
++    known = {g for g, _, _ in names}
++    missing = set(groups) - known
++    if missing:
++        raise ValueError(f"Unknown observable groups {sorted(missing)}; available: {sorted(known)}")
++    return np.array([g in groups for g, _, _ in names])
++
++
++def softmax(logits):
++    z = logits - logits.max(1, keepdims=True)
++    e = np.exp(z)
++    return e / e.sum(1, keepdims=True)
++
++
++def weighted_cross_entropy(logits, labels, weights, block=200_000):
++    """Weighted mean of -log softmax(logits)[label], as the head trainer's validation loss."""
++    total = 0.0
++    for start in range(0, len(labels), block):
++        z = logits[start:start + block].astype(np.float64)
++        z -= z.max(1, keepdims=True)
++        picked = z[np.arange(len(z)), labels[start:start + block]]
++        total += float((weights[start:start + block] * (np.log(np.exp(z).sum(1)) - picked)).sum())
++    return total / float(np.sum(weights))
++
++
++# ----------------------------------------------------------------------------- evaluation
++def evaluate_chunks(chunks, results_dir, data_config=None, network_config=None, seed=None):
++    """Score predictions with the repository's JetClass-II evaluator.
++
++    ``chunks`` yields ``(labels, probabilities[n, 188])``. The evaluator streams
++    prediction ROOT files; here its file reader is replaced by that iterator, so
++    the metric definitions are exactly the ones used for full training runs. It
++    writes ``metrics.json`` into ``results_dir`` and returns the metrics dict.
++    """
++    from integrations.weaver.eval import jetclass2_eval as evaluator
++
++    results_dir = Path(results_dir)
++    results_dir.mkdir(parents=True, exist_ok=True)
++
++    def reader(_files):
++        for labels, probabilities in chunks:
++            yield np.asarray(labels).astype(np.int64), np.asarray(probabilities, dtype=np.float32)
++
++    original = evaluator._iter_prediction_chunks
++    evaluator._iter_prediction_chunks = reader
++    try:
++        args = SimpleNamespace(data_config=data_config, network_config=network_config, seed=seed)
++        result = evaluator.evaluate_prediction_files(
++            prediction_files={"head": str(results_dir / "pred_head.root")}, args=args)
++    finally:
++        evaluator._iter_prediction_chunks = original
++    return result["metrics"]
++
++
++def geomean(values):
++    values = [v for v in values if v is not None and np.isfinite(v) and v > 0]
++    return float(np.exp(np.mean(np.log(values)))) if values else None
++
++
++def summarise(metrics):
++    """The handful of numbers the comparison is read from."""
++    out = {k: metrics.get(k) for k in SUMMARY_KEYS}
++    group = lambda names: geomean([metrics.get(f"rej50_per_group/{g}") for g in names])
++    out.update({"rej50_4prong": group(FOUR_PRONG), "rej50_3prong": group(THREE_PRONG),
++                "rej50_2prong": group(TWO_PRONG)})
++    out.update({f"rej50/{g}": metrics.get(f"rej50_per_group/{g}") for g in HADRONIC})
++    out.update({f"pair/{p}": metrics.get(f"rej50_pairs/{p}") for p in PAIRS})
++    return out
++
++
++def compare(arms, reference):
++    """Mean over seeds per arm and its relative change against the reference arm.
++
++    ``arms`` maps arm name to a list of ``summarise`` dicts, one per seed, with
++    seeds in the same order for every arm so the differences are paired.
++    """
++    table = {}
++    for name, runs in arms.items():
++        row = {}
++        for key in runs[0]:
++            values = np.array([np.nan if r[key] is None else r[key] for r in runs], dtype=float)
++            base = np.array([np.nan if r[key] is None else r[key] for r in arms[reference]], dtype=float)
++            with np.errstate(divide="ignore", invalid="ignore"):
++                ratio = values / base - 1.0
++            row[key] = dict(mean=float(np.nanmean(values)) if np.isfinite(values).any() else None,
++                            change=float(np.nanmean(ratio)) if np.isfinite(ratio).any() else None,
++                            change_spread=float(np.nanstd(ratio)) if np.isfinite(ratio).sum() > 1 else None)
++        table[name] = row
++    return table
++
++
++def format_table(table, reference, keys=("rej50_geomean_hadronic", "rej50_4prong", "rej50_3prong",
++                                         "rej50_2prong", "pair/X_bb_vs_QCD_bb", "pair/X_bb_vs_X_cc",
++                                         "accuracy_top1", "val_loss")):
++    """Plain-text table: value for the reference arm, relative change for the others."""
++    width = max(len(n) for n in table) + 2
++    lines = ["arm".ljust(width) + "".join(k.split("/")[-1][:18].rjust(20) for k in keys)]
++    for name, row in table.items():
++        cells = []
++        for k in keys:
++            cell = row.get(k, {})
++            if name == reference:
++                cells.append("-" if cell.get("mean") is None else f"{cell['mean']:.4g}")
++            elif cell.get("change") is None:
++                cells.append("-")
++            else:
++                spread = "" if cell.get("change_spread") is None else f" ±{100 * cell['change_spread']:.1f}"
++                cells.append(f"{100 * cell['change']:+.1f}%{spread}")
++        lines.append(name.ljust(width) + "".join(c.rjust(20) for c in cells))
++    return "\n".join(lines)
+diff --git a/src/aio/analysis/jet_observables.py b/src/aio/analysis/jet_observables.py
+new file mode 100644
+index 0000000..b38af00
+--- /dev/null
++++ b/src/aio/analysis/jet_observables.py
+@@ -0,0 +1,411 @@
++"""Hand-computed jet observables from constituent four-momenta (NumPy only).
++
++Every observable is a function of the padded constituent four-momenta that the
++tagger itself receives, so nothing here adds information the model was not
++given. With the JetClass-II kin config those momenta are scaled so the jet has
++pT = 500; dimensionful outputs (masses, kT) are therefore in units of
++jet pT / 500 and never reveal the absolute jet pT.
++
++Inputs are batches ``p[B, N, 4] = (px, py, pz, E)`` with a boolean ``mask[B, N]``.
++Angles use rapidity and wrapped azimuth, as FastJet does.
++"""
++from __future__ import annotations
++
++from functools import lru_cache
++from itertools import combinations
++
++import numpy as np
++
++R0 = 0.8
++TINY = 1e-12
++GROUPS = ("basic", "subjets", "nsub", "ecf", "pull", "lund", "softdrop")
++LUND_EMISSIONS = 6
++LUND_KT_THRESHOLDS = (1.0, 5.0, 20.0)  # scaled units: kT / jet pT = 0.002, 0.01, 0.04
++SOFTDROP_ZCUT = 0.1
++
++
++# --------------------------------------------------------------------------- kinematics
++def kinematics(p):
++    """Return (pt, rapidity, phi) for four-momenta ``p[..., 4]``."""
++    px, py, pz, e = np.moveaxis(p, -1, 0)
++    pt = np.hypot(px, py)
++    y = 0.5 * np.log(np.maximum(e + pz, TINY) / np.maximum(e - pz, TINY))
++    return pt, y, np.arctan2(py, px)
++
++
++def mass(p):
++    """Invariant mass; values below the float cancellation noise of E^2 - p^2 are zero."""
++    px, py, pz, e = np.moveaxis(p, -1, 0)
++    m2 = e * e - px * px - py * py - pz * pz
++    return np.sqrt(np.where(m2 > 1e-10 * e * e, m2, 0.0))
++
++
++def wrap(dphi):
++    return (dphi + np.pi) % (2 * np.pi) - np.pi
++
++
++def delta_r2(y1, phi1, y2, phi2):
++    return (y1 - y2) ** 2 + wrap(phi1 - phi2) ** 2
++
++
++def _ratio(a, b):
++    return np.divide(a, b, out=np.zeros_like(a, dtype=np.float64), where=b > 0)
++
++
++# --------------------------------------------------------------------------- clustering
++def cluster(p, mask, power, snapshots=(4, 3, 2)):
++    """Sequential recombination (generalised kT, E-scheme, no beam distance).
++
++    ``power`` 1 is kT and 0 is Cambridge/Aachen. Slot ``i`` keeps the merged
++    pseudojet and slot ``j`` is retired. Returns the merge history and, for each
++    K in ``snapshots``, the state when exactly K pseudojets remain.
++    """
++    p = np.where(mask[..., None], p, 0.0).astype(np.float64)
++    B, N, _ = p.shape
++    rows = np.arange(B)
++    P, alive = p.copy(), mask.copy()
++    label = np.where(mask, np.arange(N)[None, :], -1)
++    count = mask.sum(1)
++    pt, y, phi = kinematics(P)
++    weight = pt ** (2 * power) if power else np.ones_like(pt)
++    D = np.minimum(weight[:, :, None], weight[:, None, :]) * delta_r2(
++        y[:, :, None], phi[:, :, None], y[:, None, :], phi[:, None, :])
++    D[~(alive[:, :, None] & alive[:, None, :])] = np.inf
++    D[:, np.arange(N), np.arange(N)] = np.inf
++
++    steps = max(N - 1, 0)
++    hist = dict(i=np.full((B, steps), -1), j=np.full((B, steps), -1), d=np.zeros((B, steps)),
++                pa=np.zeros((B, steps, 4)), pb=np.zeros((B, steps, 4)),
++                valid=np.zeros((B, steps), dtype=bool))
++    snap = {K: dict(ok=np.zeros(B, dtype=bool), label=np.full((B, N), -1),
++                    P=np.zeros((B, N, 4)), alive=np.zeros((B, N), dtype=bool)) for K in snapshots}
++
++    def take(which):
++        for K, s in snap.items():
++            hit = which[count[which] == K]
++            if len(hit):
++                s["ok"][hit], s["label"][hit], s["P"][hit], s["alive"][hit] = True, label[hit], P[hit], alive[hit]
++
++    take(rows)
++    for step in range(steps):
++        b = np.nonzero(count >= 2)[0]
++        if not len(b):
++            break
++        flat = D.reshape(B, -1)
++        idx = flat.argmin(1)[b]
++        i, j = idx // N, idx % N
++        hist["i"][b, step], hist["j"][b, step], hist["d"][b, step] = i, j, flat[b, idx]
++        hist["pa"][b, step], hist["pb"][b, step], hist["valid"][b, step] = P[b, i], P[b, j], True
++        P[b, i] += P[b, j]
++        P[b, j] = 0.0
++        alive[b, j] = False
++        label[b] = np.where(label[b] == j[:, None], i[:, None], label[b])
++        pt[b, i], y[b, i], phi[b, i] = kinematics(P[b, i])
++        weight[b, i] = pt[b, i] ** (2 * power) if power else 1.0
++        d = np.minimum(weight[b, i][:, None], weight[b]) * delta_r2(
++            y[b, i][:, None], phi[b, i][:, None], y[b], phi[b])
++        d[~alive[b]] = np.inf
++        d[np.arange(len(b)), i] = np.inf
++        D[b, i, :], D[b, :, i] = d, d
++        D[b, j, :], D[b, :, j] = np.inf, np.inf
++        count[b] -= 1
++        take(b)
++    return dict(hist=hist, snap=snap, n=mask.sum(1))
++
++
++def exclusive_subjets(snapshot, K):
++    """Subjet momenta sorted by pT and each particle's subjet index (-1 if none)."""
++    B, N, _ = snapshot["P"].shape
++    extra = max(K - N, 0)   # batches narrower than K have no valid K-subjet state
++    P = np.pad(snapshot["P"], ((0, 0), (0, extra), (0, 0)))
++    pt = np.where(np.pad(snapshot["alive"], ((0, 0), (0, extra))), kinematics(P)[0], -1.0)
++    order = np.argsort(-pt, axis=1, kind="stable")[:, :K]
++    sub = np.take_along_axis(P, order[..., None], axis=1)
++    member = np.full((B, N), -1)
++    for k in range(K):
++        member[snapshot["label"] == order[:, k][:, None]] = k
++    member[snapshot["label"] < 0] = -1
++    ok = snapshot["ok"]
++    sub[~ok] = 0.0
++    member[~ok] = -1
++    return sub, member
++
++
++# --------------------------------------------------------------------------- observable blocks
++def _basic(p, mask, pt, y, phi, jet, names, cols):
++    jpt, jy, jphi = kinematics(jet)
++    z = _ratio(pt, pt.sum(1, keepdims=True))
++    dr = np.sqrt(delta_r2(y, phi, jy[:, None], jphi[:, None])) * mask
++    top = -np.sort(-z, axis=1)[:, :3]
++    top = np.pad(top, ((0, 0), (0, 3 - top.shape[1])))
++    values = dict(n_const=mask.sum(1).astype(np.float64), jet_mass=mass(jet),
++                  width=(z * dr).sum(1), lha=(z * np.sqrt(dr / R0)).sum(1),
++                  thrust=(z * (dr / R0) ** 2).sum(1), ptd=np.sqrt((z * z).sum(1)),
++                  z1=top[:, 0], z2=top[:, 1], z3=top[:, 2])
++    for k, v in values.items():
++        names.append(("basic", k, k in ("jet_mass", "width", "lha", "thrust")))
++        cols.append(v)
++
++
++def _subjets(kt, pt, names, cols):
++    out = {}
++    for K in (2, 3, 4):
++        sub, member = exclusive_subjets(kt["snap"][K], K)
++        spt, sy, sphi = kinematics(sub)
++        total = spt.sum(1, keepdims=True)
++        for k in range(K):
++            names.append(("subjets", f"kt{K}_m{k+1}", True))
++            cols.append(mass(sub[:, k]))
++            names.append(("subjets", f"kt{K}_z{k+1}", False))
++            cols.append(_ratio(spt, total)[:, k])
++            names.append(("subjets", f"kt{K}_n{k+1}", False))
++            cols.append((member == k).sum(1).astype(np.float64))
++        for a in range(K):
++            for b in range(a + 1, K):
++                names.append(("subjets", f"kt{K}_dr{a+1}{b+1}", True))
++                cols.append(np.sqrt(delta_r2(sy[:, a], sphi[:, a], sy[:, b], sphi[:, b])) * kt["snap"][K]["ok"])
++                names.append(("subjets", f"kt{K}_m{a+1}{b+1}", True))
++                cols.append(mass(sub[:, a] + sub[:, b]))
++        out[K] = (sub, member)
++    hist, n = kt["hist"], kt["n"]
++    rows, steps = np.arange(len(n)), hist["d"].shape[1]
++    for K in (2, 3, 4):  # kT scale of the merge that takes K pseudojets to K - 1
++        step = n - K
++        d = np.zeros(len(n))
++        if steps:
++            d = np.where(step >= 0, hist["d"][rows, np.clip(step, 0, steps - 1)], 0.0)
++        names.append(("subjets", f"kt_d{K-1}{K}", True))
++        cols.append(np.sqrt(d))
++    return out
++
++
++def _nsub(subjets, jet, pt, y, phi, mask, names, cols):
++    norm = pt.sum(1) * R0
++    axes = {1: jet[:, None, :]}
++    axes.update({K: subjets[K][0] for K in (2, 3, 4)})
++    tau = {}
++    for K in (1, 2, 3, 4):
++        apt, ay, aphi = kinematics(axes[K])
++        dr = np.sqrt(delta_r2(y[:, :, None], phi[:, :, None], ay[:, None, :], aphi[:, None, :]))
++        dr = np.where((apt > 0)[:, None, :], dr, np.inf).min(2)
++        dr = np.where(np.isfinite(dr), dr, 0.0)
++        tau[K] = _ratio((pt * dr * mask).sum(1), norm)
++        names.append(("nsub", f"tau{K}", True))
++        cols.append(tau[K])
++    for K in (2, 3, 4):
++        names.append(("nsub", f"tau{K}{K-1}", False))
++        cols.append(_ratio(tau[K], tau[K - 1]))
++
++
++@lru_cache(maxsize=None)
++def _combinations(n, r):
++    index = np.array(list(combinations(range(n), r)), dtype=int).reshape(-1, r)
++    return tuple(index[:, c] for c in range(r))
++
++
++def _top_by_pt(pt, y, phi, mask, k):
++    order = np.argsort(-np.where(mask, pt, -1.0), axis=1, kind="stable")[:, :k]
++    take = lambda a: np.take_along_axis(a, order, axis=1)
++    m = take(mask)
++    return take(pt) * m, take(y), take(phi), m
++
++
++def _ecf(pt, y, phi, mask, names, cols, top4=24, top3=32, top4g=16):
++    """Energy correlators. e2 and e3 use every particle; e4 and the generalised
++    correlators use the hardest ``top4`` / ``top3`` / ``top4g`` particles, with
++    energy fractions still normalised to the full jet."""
++    total = pt.sum(1, keepdims=True)
++    z = _ratio(pt, total) * mask
++    R = np.sqrt(delta_r2(y[:, :, None], phi[:, :, None], y[:, None, :], phi[:, None, :]))
++    R = R * (mask[:, :, None] & mask[:, None, :])
++    pt4, y4, phi4, m4 = _top_by_pt(pt, y, phi, mask, top4)
++    z4 = _ratio(pt4, total)
++    R4 = np.sqrt(delta_r2(y4[:, :, None], phi4[:, :, None], y4[:, None, :], phi4[:, None, :]))
++    R4 = R4 * (m4[:, :, None] & m4[:, None, :])
++    e = {}
++    for beta in (1, 2):
++        Rb = R if beta == 1 else R * R
++        e2 = 0.5 * np.einsum("bi,bij,bj->b", z, Rb, z)
++        A = z[:, :, None] * Rb                         # tr(A^3) = 6 * sum_{i<j<k} zzz RRR
++        e3 = np.einsum("bij,bji->b", A @ A, A) / 6.0
++        Rb4 = R4 if beta == 1 else R4 * R4
++        # e4 = sum_l z_l tr(A_l^3) / 24 with A_l[i, j] = z_i R_il R_ij
++        Al = (z4[:, None, :] * Rb4)[:, :, :, None] * Rb4[:, None, :, :]
++        e4 = np.einsum("bl,bl->b", z4, np.einsum("blij,blji->bl", Al @ Al, Al)) / 24.0
++        e[beta] = (e2, e3, e4)
++        for k, v in zip((2, 3, 4), (e2, e3, e4)):
++            names.append(("ecf", f"e{k}_b{beta}", True))
++            cols.append(v)
++        names.append(("ecf", f"C2_b{beta}", True))
++        cols.append(_ratio(e3, e2 ** 2))
++        names.append(("ecf", f"D2_b{beta}", True))
++        cols.append(_ratio(e3, e2 ** 3))
++        names.append(("ecf", f"C3_b{beta}", True))
++        cols.append(_ratio(e4 * e2, e3 ** 2))
++        names.append(("ecf", f"D3_b{beta}", True))
++        cols.append(_ratio(e4 * e2 ** 3, e3 ** 3))
++    # Generalised correlators with the product of the v smallest angles (Moult, Necib, Thaler).
++    e2_1 = e[1][0]
++    pt3, y3, phi3, _ = _top_by_pt(pt, y, phi, mask, top3)
++    z3 = _ratio(pt3, total)
++    R3 = np.sqrt(delta_r2(y3[:, :, None], phi3[:, :, None], y3[:, None, :], phi3[:, None, :]))
++    i, j, k = _combinations(R3.shape[1], 3)
++    if len(i):
++        a, b, c = R3[:, i, j], R3[:, i, k], R3[:, j, k]
++        low, high = np.minimum(np.minimum(a, b), c), np.maximum(np.maximum(a, b), c)
++        zzz = z3[:, i] * z3[:, j] * z3[:, k]
++        e3_1 = (zzz * low).sum(1)
++        e3_2 = (zzz * _ratio(a * b * c, high)).sum(1)   # product of the two smallest angles
++    else:
++        e3_1 = e3_2 = np.zeros(len(pt))
++    names.append(("ecf", "N2_b1", True))
++    cols.append(_ratio(e3_2, e2_1 ** 2))
++    ptg, yg, phig, _ = _top_by_pt(pt, y, phi, mask, top4g)
++    zg = _ratio(ptg, total)
++    Rg = np.sqrt(delta_r2(yg[:, :, None], phig[:, :, None], yg[:, None, :], phig[:, None, :]))
++    a, b, c, d = _combinations(Rg.shape[1], 4)
++    if len(a):
++        ang = np.stack((Rg[:, a, b], Rg[:, a, c], Rg[:, a, d], Rg[:, b, c], Rg[:, b, d], Rg[:, c, d]), -1)
++        ang = np.partition(ang, 1, axis=-1)
++        e4_2 = (zg[:, a] * zg[:, b] * zg[:, c] * zg[:, d] * ang[..., 0] * ang[..., 1]).sum(1)
++    else:
++        e4_2 = np.zeros(len(pt))
++    names.append(("ecf", "N3_b1", True))
++    cols.append(_ratio(e4_2, e3_1 ** 2))
++
++
++def _pull_vector(pt, y, phi, weight_mask, axis):
++    apt, ay, aphi = kinematics(axis)
++    dy, dphi = (y - ay[:, None]) * weight_mask, wrap(phi - aphi[:, None]) * weight_mask
++    r = np.hypot(dy, dphi)
++    scale = _ratio(pt * r * weight_mask, apt[:, None])
++    return (scale * dy).sum(1), (scale * dphi).sum(1)
++
++
++def _pull(subjets, jet, pt, y, phi, mask, names, cols):
++    ty, tphi = _pull_vector(pt, y, phi, mask, jet)
++    names.append(("pull", "jet_pull", True))
++    cols.append(np.hypot(ty, tphi))
++    sub, member = subjets[2]
++    spt, sy, sphi = kinematics(sub)
++    for a, b in ((0, 1), (1, 0)):
++        ty, tphi = _pull_vector(pt, y, phi, member == a, sub[:, a])
++        mag = np.hypot(ty, tphi)
++        cy, cphi = sy[:, b] - sy[:, a], wrap(sphi[:, b] - sphi[:, a])
++        cos = _ratio(ty * cy + tphi * cphi, mag * np.hypot(cy, cphi))
++        names.append(("pull", f"pull{a+1}_mag", True))
++        cols.append(mag)
++        names.append(("pull", f"pull{a+1}{b+1}_angle", False))
++        cols.append(np.arccos(np.clip(cos, -1.0, 1.0)) * (mag > 0))
++
++
++def primary_lund(ca):
++    """Primary Lund declustering: follow the harder branch from the full jet.
++
++    Returns arrays ``[B, steps]`` in declustering order (widest first) and a count.
++    """
++    hist = ca["hist"]
++    B, steps = hist["valid"].shape
++    out = {k: np.zeros((B, steps)) for k in ("delta", "kt", "z", "m")}
++    count = np.zeros(B, dtype=int)
++    current = np.full(B, -1)
++    for step in range(steps - 1, -1, -1):
++        valid = hist["valid"][:, step]
++        first = valid & (current < 0)
++        current[first] = hist["i"][first, step]
++        hit = np.nonzero(valid & (hist["i"][:, step] == current))[0]
++        if not len(hit):
++            continue
++        pa, pb = hist["pa"][hit, step], hist["pb"][hit, step]
++        pta, ya, phia = kinematics(pa)
++        ptb, yb, phib = kinematics(pb)
++        a_harder = pta >= ptb
++        delta = np.sqrt(delta_r2(ya, phia, yb, phib))
++        soft = np.minimum(pta, ptb)
++        c = count[hit]
++        out["delta"][hit, c], out["kt"][hit, c] = delta, soft * delta
++        out["z"][hit, c], out["m"][hit, c] = _ratio(soft, pta + ptb), mass(pa + pb)
++        count[hit] += 1
++        current[hit] = np.where(a_harder, hist["i"][hit, step], hist["j"][hit, step])
++    return out, count
++
++
++def _lund_and_softdrop(ca, names, cols):
++    lund, count = primary_lund(ca)
++    B, steps = lund["kt"].shape
++    pad = lambda a: np.pad(a, ((0, 0), (0, max(LUND_EMISSIONS - steps, 0))))[:, :LUND_EMISSIONS]
++    present = np.arange(max(steps, 1))[None, :] < count[:, None] if steps else np.zeros((B, 0), bool)
++    for e in range(LUND_EMISSIONS):
++        for key, log in (("delta", True), ("kt", True), ("z", False)):
++            names.append(("lund", f"lund{e+1}_{key}", log))
++            cols.append(pad(lund[key])[:, e])
++    kt = np.where(present, lund["kt"], -1.0) if steps else np.full((B, 1), -1.0)
++    hardest = kt.argmax(1)
++    rows = np.arange(B)
++    for key, log in (("delta", True), ("kt", True), ("z", False)):
++        names.append(("lund", f"lund_hardest_{key}", log))
++        cols.append(lund[key][rows, hardest] * (count > 0) if steps else np.zeros(B))
++    for threshold in LUND_KT_THRESHOLDS:
++        names.append(("lund", f"lund_n_kt{threshold:g}", False))
++        cols.append((kt > threshold).sum(1).astype(np.float64))
++    names.append(("lund", "lund_n_primary", False))
++    cols.append(count.astype(np.float64))
++    # Soft drop with beta = 0: first primary splitting with z >= zcut.
++    passed = (present & (lund["z"] >= SOFTDROP_ZCUT)) if steps else np.zeros((B, 1), bool)
++    found = passed.any(1)
++    first = passed.argmax(1)
++    pick = lambda a: (a[rows, first] * found) if steps else np.zeros(B)
++    for name, value, log in (("sd_mass", pick(lund["m"]), True), ("sd_zg", pick(lund["z"]), False),
++                             ("sd_rg", pick(lund["delta"]), True),
++                             ("sd_ndrop", np.where(found, first, count).astype(np.float64), False)):
++        names.append(("softdrop", name, log))
++        cols.append(value)
++
++
++# --------------------------------------------------------------------------- entry points
++def compute_batch(p, mask):
++    """All observables for one padded batch. Returns (values[B, F], names).
++
++    ``names`` is a list of ``(group, name, log_scale)``; ``log_scale`` marks
++    non-negative heavy-tailed quantities the caller should take the log of.
++    """
++    p = np.asarray(p, dtype=np.float64)
++    pt_all = np.hypot(p[..., 0], p[..., 1])
++    mask = np.asarray(mask, dtype=bool) & (pt_all > 1e-9) & (p[..., 3] > 0)
++    p = np.where(mask[..., None], p, 0.0)
++    pt, y, phi = kinematics(p)
++    pt = pt * mask
++    jet = p.sum(1)
++    names, cols = [], []
++    _basic(p, mask, pt, y, phi, jet, names, cols)
++    subjets = _subjets(cluster(p, mask, 1), pt, names, cols)
++    _nsub(subjets, jet, pt, y, phi, mask, names, cols)
++    _ecf(pt, y, phi, mask, names, cols)
++    _pull(subjets, jet, pt, y, phi, mask, names, cols)
++    _lund_and_softdrop(cluster(p, mask, 0, snapshots=()), names, cols)
++    values = np.stack(cols, 1)
++    return np.where(np.isfinite(values), values, 0.0), names
++
++
++def compute(vectors, offsets, chunk=256):
++    """Observables for ragged jets: ``vectors[total, 4]`` and ``offsets[n_jets + 1]``.
++
++    Jets are processed in multiplicity order so each padded batch is tight.
++    """
++    counts = np.diff(offsets)
++    order = np.argsort(counts, kind="stable")
++    out, names = None, None
++    for start in range(0, len(order), chunk):
++        jets = order[start:start + chunk]
++        width = max(int(counts[jets].max()), 1)
++        p = np.zeros((len(jets), width, 4))
++        mask = np.arange(width)[None, :] < counts[jets][:, None]
++        p[mask] = np.concatenate([vectors[offsets[j]:offsets[j + 1]] for j in jets]) if mask.any() else 0.0
++        values, names = compute_batch(p, mask)
++        if out is None:
++            out = np.zeros((len(counts), values.shape[1]), dtype=np.float32)
++        out[jets] = values
++    if out is None:
++        _, names = compute_batch(np.zeros((1, 1, 4)), np.zeros((1, 1), bool))
++        out = np.zeros((0, len(names)), dtype=np.float32)
++    return out, names
+diff --git a/tests/test_head_probe.py b/tests/test_head_probe.py
+new file mode 100644
+index 0000000..47003ad
+--- /dev/null
++++ b/tests/test_head_probe.py
+@@ -0,0 +1,163 @@
++"""Frozen-embedding head test: reweighting, scaling, evaluation and an end-to-end smoke run."""
++import importlib.util
++import json
++from pathlib import Path
++import sys
++import types
++
++import numpy as np
++import pytest
++import yaml
++
++if "uproot" not in sys.modules and importlib.util.find_spec("uproot") is None:   # imported by the evaluator, never used here
++    sys.modules["uproot"] = types.ModuleType("uproot")
++
++from aio.analysis import head_probe as hp
++from aio.analysis import jet_observables as jo
++
++ROOT = Path(__file__).resolve().parents[1]
++CONFIG = yaml.safe_load((ROOT / "configs/datasets/jetclass2/JetClassII_kin.yaml").read_text())
++
++
++def test_class_membership_covers_every_label_once():
++    labels = np.arange(188)
++    index = hp.class_membership(labels, CONFIG)
++    classes = CONFIG["weights"]["reweight_classes"]
++    assert index.min() == 0 and index.max() == len(classes) - 1
++    assert classes[index[9]] == "label_X_gg" and classes[index[77]] == "label_X_YY_gggg"
++    assert set(index[161:]) == {classes.index("label_QCD")}
++
++
++def test_flat_reweighting_flattens_spectra_and_sets_class_balance():
++    rng = np.random.default_rng(0)
++    n = 400_000
++    labels = rng.choice([3, 9, 170], size=n, p=[0.5, 0.2, 0.3])           # X_QQ, X_gg, QCD
++    pt = 200 + 2300 * rng.beta(1.0, 4.0, n)                                # steeply falling
++    mass = 20 + 480 * rng.beta(2.0, 3.0, n)
++    index = hp.class_membership(labels, CONFIG)
++    hists = hp.flat_reweight_hists(index, pt, mass, CONFIG)
++    w = hp.event_weights(index, pt, mass, hists, CONFIG)
++    assert 0 < w.max() <= 0.9 + 1e-6
++    classes, class_weights = CONFIG["weights"]["reweight_classes"], CONFIG["weights"]["class_weights"]
++    totals = {classes[c]: w[index == c].sum() for c in np.unique(index)}
++    expected = {name: class_weights[classes.index(name)] for name in totals}
++    ratio = totals["label_X_QQ"] / totals["label_QCD"]
++    assert ratio == pytest.approx(expected["label_X_QQ"] / expected["label_QCD"], rel=0.02)
++    # Within a class the weighted pT spectrum is far flatter than the raw one.
++    member = index == classes.index("label_X_QQ")
++    bins = CONFIG["weights"]["reweight_vars"]["jet_pt"]
++    raw = np.histogram(pt[member], bins)[0][:8]
++    flat = np.histogram(pt[member], bins, weights=w[member])[0][:8]
++    assert raw.max() / raw.min() > 1.3 and flat.max() / flat.min() < 1.05
++    assert 0 < hp.effective_sample_size(w) < n
++
++
++def test_event_weights_follow_weaver_for_overflow_and_auto_yaml(tmp_path):
++    classes = CONFIG["weights"]["reweight_classes"]
++    pt_bins, mass_bins = CONFIG["weights"]["reweight_vars"].values()
++    hists = {name: np.full((len(pt_bins) - 1, len(mass_bins) - 1), 0.5, dtype=np.float32) for name in classes}
++    hists["label_QCD"][0, 0] = 0.25
++    index = hp.class_membership(np.array([3, 170, 170, 3, 3]), CONFIG)
++    w = hp.event_weights(index, np.array([300.0, 210.0, 2600.0, 199.0, 2500.0]),
++                         np.array([100.0, 25.0, 100.0, 100.0, 500.0]), hists, CONFIG)
++    assert w.tolist() == [0.5, 0.25, 0.0, 0.0, 0.5]        # outside the binning: discarded, as in Weaver
++
++    config_path = tmp_path / "data.yaml"
++    config_path.write_text("weights: {}\n")
++    assert hp.weaver_auto_yaml(config_path) is None
++    import hashlib
++    auto = tmp_path / f"data.{hashlib.md5(config_path.read_bytes()).hexdigest()}.auto.yaml"
++    auto.write_text(yaml.safe_dump({"weights": {"reweight_hists": {k: v.tolist() for k, v in hists.items()}}}))
++    assert hp.weaver_auto_yaml(config_path) == auto
++    loaded = hp.load_reweight_hists(auto)
++    assert set(loaded) == set(classes) and loaded["label_QCD"][0, 0] == pytest.approx(0.25)
++    with pytest.raises(ValueError):
++        hp.load_reweight_hists(config_path)
++
++    logits = np.log(np.array([[0.7, 0.2, 0.1], [0.1, 0.1, 0.8]]))
++    loss = hp.weighted_cross_entropy(logits + 3.0, np.array([0, 1]), np.array([1.0, 3.0]))
++    assert loss == pytest.approx((-np.log(0.7) - 3 * np.log(0.1)) / 4)
++
++
++def test_feature_scaler_logs_standardises_and_handles_zeros():
++    rng = np.random.default_rng(1)
++    x = np.stack((np.exp(rng.normal(0, 3, 5000)), rng.normal(5, 2, 5000)), 1)
++    x[:50, 0] = 0.0
++    scaler = hp.FeatureScaler([True, False]).fit(x)
++    z = scaler.transform(x)
++    assert z.dtype == np.float32 and np.isfinite(z).all() and np.abs(z).max() <= hp.CLIP
++    assert abs(z[:, 1].mean()) < 1e-3 and z[:, 1].std() == pytest.approx(1, abs=1e-3)
++    assert (z[:50, 0] < z[50:, 0].min() + 1e-6).all()          # zeros sit just below the valid range
++    assert hp.select_columns([("a", "x", True), ("b", "y", False)], ("b",)).tolist() == [False, True]
++    with pytest.raises(ValueError):
++        hp.select_columns([("a", "x", True)], ("missing",))
++
++
++def synthetic_split(directory, rng, per_class):
++    """Jets whose prong count follows the label; the embedding knows the label only weakly."""
++    from integrations.weaver.eval import jetclass2_eval as evaluator
++    directory.mkdir(parents=True)
++    prongs = np.ones(188, dtype=int)
++    prongs[:15] = 2
++    prongs[evaluator.THREE_PRONG_INDICES] = 3
++    prongs[evaluator.FOUR_PRONG_INDICES] = 4
++    labels = np.repeat(np.arange(188), per_class)
++    rng.shuffle(labels)
++    vectors, counts = [], []
++    for label in labels:
++        k, n = prongs[label], 16
++        axes = rng.normal(0, 0.25, (k, 2))
++        which = rng.integers(0, k, n)
++        y, phi = (axes[which] + rng.normal(0, 0.03, (n, 2))).T
++        pt = 500 * rng.dirichlet(np.full(n, 0.7))
++        vectors.append(np.stack((pt * np.cos(phi), pt * np.sin(phi), pt * np.sinh(y), pt * np.cosh(y)), 1))
++        counts.append(n)
++    signal = (prongs[labels] - 2.5)[:, None]
++    embedding = np.concatenate((0.15 * signal + rng.normal(size=(len(labels), 1)),
++                                rng.normal(size=(len(labels), 7))), 1).astype(np.float32)
++    np.savez(directory / "Synthetic_0000.npz", label=labels.astype(np.int16), embedding=embedding,
++             logits=rng.normal(size=(len(labels), 188)).astype(np.float32),
++             jet_pt=rng.uniform(200, 2500, len(labels)).astype(np.float32),
++             jet_sdmass=rng.uniform(20, 500, len(labels)).astype(np.float32),
++             part_vectors=np.concatenate(vectors).astype(np.float32),
++             part_offsets=np.concatenate(([0], np.cumsum(counts))))
++    return labels
++
++
++def test_end_to_end_with_the_repository_evaluator(tmp_path, monkeypatch, capsys):
++    from integrations.weaver.eval import jetclass2_eval as evaluator
++    from scripts import compute_jet_observables, train_embedding_head
++
++    rng = np.random.default_rng(5)
++    shards = tmp_path / "shards"
++    for split, per_class in (("train", 10), ("val", 4), ("test", 6)):
++        synthetic_split(shards / split, rng, per_class)
++    (shards / "train" / "Synthetic_0001.tmp.npz").write_bytes(b"unfinished")     # must be ignored
++    monkeypatch.setattr(sys, "argv", ["compute", *(str(shards / s) for s in ("train", "val", "test")),
++                                      "--workers", "1"])
++    compute_jet_observables.main()
++    names = hp.load_observable_names(shards / "train")
++    assert [tuple(n) for n in names] == jo.compute_batch(np.zeros((1, 1, 4)), np.zeros((1, 1), bool))[1]
++    loaded = hp.load_split(shards / "test")
++    assert loaded["obs"].shape == (188 * 6, len(names)) and np.isfinite(loaded["obs"]).all()
++
++    reader = evaluator._iter_prediction_chunks
++    monkeypatch.setattr(evaluator, "roc_auc_score", lambda *a, **k: 0.5)   # the slow sampled 188-way AUC
++    output = tmp_path / "heads"
++    monkeypatch.setattr(sys, "argv", ["train", "--shards", str(shards), "--output", str(output),
++                                      "--backend", "sklearn", "--arms", "embedding", "embedding+nsub", "obs_only",
++                                      "--seeds", "0", "1", "--epochs", "40", "--hidden", "64",
++                                      "--samples-per-epoch", "4000", "--batch-size", "256"])
++    train_embedding_head.main()
++    assert evaluator._iter_prediction_chunks is reader            # the evaluator is restored
++    summary = json.loads((output / "summary.json").read_text())
++    assert set(summary["table"]) == {"parT_head", "embedding", "embedding+nsub", "obs_only"}
++    assert (output / "embedding+nsub" / "seed1" / "metrics.json").is_file()
++    metrics = json.loads((output / "embedding" / "seed0" / "metrics.json").read_text())
++    assert metrics["model"]["network_config"] == "head:embedding" and metrics["run"]["seed"] == 0
++    accuracy = {arm: row["accuracy_top1"]["mean"] for arm, row in summary["table"].items()}
++    # N-subjettiness separates the prong counts that the weak embedding cannot.
++    assert accuracy["embedding+nsub"] > 1.5 * accuracy["embedding"]
++    assert summary["table"]["embedding+nsub"]["accuracy_top1"]["change"] > 0.5
++    assert summary["table"]["embedding"]["accuracy_top1"]["change"] == pytest.approx(0)
++    assert "embedding+nsub" in capsys.readouterr().out
+diff --git a/tests/test_jet_observables.py b/tests/test_jet_observables.py
+new file mode 100644
+index 0000000..f052f97
+--- /dev/null
++++ b/tests/test_jet_observables.py
+@@ -0,0 +1,223 @@
++"""Check the batched observables against slow per-jet reference code."""
++from itertools import combinations
++
++import numpy as np
++import pytest
++
++from aio.analysis import jet_observables as jo
++
++
++def random_jets(rng, sizes, width=128):
++    p = np.zeros((len(sizes), width, 4))
++    mask = np.zeros((len(sizes), width), dtype=bool)
++    for b, n in enumerate(sizes):
++        pt = np.exp(rng.uniform(np.log(0.3), np.log(200.0), n))
++        y = 0.4 + 0.5 * rng.normal(size=n).clip(-1.5, 1.5)
++        phi = 2.9 + 0.5 * rng.normal(size=n).clip(-1.5, 1.5)   # straddles the +-pi seam
++        m = rng.uniform(0.0, 0.3, n) * (rng.random(n) < 0.5)
++        mt = np.hypot(pt, m)
++        p[b, :n] = np.stack((pt * np.cos(phi), pt * np.sin(phi), mt * np.sinh(y), mt * np.cosh(y)), 1)
++        mask[b, :n] = True
++    return p, mask
++
++
++def table(p, mask):
++    values, names = jo.compute_batch(p, mask)
++    return {name: values[:, i] for i, (_, name, _) in enumerate(names)}
++
++
++# ----------------------------------------------------------------------------- references
++def kin(v):
++    pt = np.hypot(v[0], v[1])
++    return pt, 0.5 * np.log((v[3] + v[2]) / (v[3] - v[2])), np.arctan2(v[1], v[0])
++
++
++def dr(a, b):
++    _, ya, pa = kin(a)
++    _, yb, pb = kin(b)
++    d = (pa - pb + np.pi) % (2 * np.pi) - np.pi
++    return np.hypot(ya - yb, d)
++
++
++def inv_mass(v):
++    return np.sqrt(max(v[3] ** 2 - v[0] ** 2 - v[1] ** 2 - v[2] ** 2, 0.0))
++
++
++def ref_cluster(parts, power):
++    """Return a list of merges and, per number of remaining clusters, the clusters."""
++    nodes = [dict(p=v.copy(), members=[i], children=None) for i, v in enumerate(parts)]
++    live = list(range(len(nodes)))
++    states = {len(live): [nodes[i] for i in live]}
++    scales = {}
++    while len(live) > 1:
++        best = None
++        for a, b in combinations(live, 2):
++            wa, wb = kin(nodes[a]["p"])[0] ** (2 * power), kin(nodes[b]["p"])[0] ** (2 * power)
++            d = min(wa, wb) * dr(nodes[a]["p"], nodes[b]["p"]) ** 2
++            if best is None or d < best[0]:
++                best = (d, a, b)
++        d, a, b = best
++        scales[len(live)] = d
++        nodes.append(dict(p=nodes[a]["p"] + nodes[b]["p"], members=nodes[a]["members"] + nodes[b]["members"],
++                          children=(nodes[a], nodes[b])))
++        live = [i for i in live if i not in (a, b)] + [len(nodes) - 1]
++        states[len(live)] = [nodes[i] for i in live]
++    return states, scales, nodes[-1]
++
++
++def ref_primary(root):
++    out, node = [], root
++    while node["children"]:
++        a, b = node["children"]
++        pa, pb = kin(a["p"])[0], kin(b["p"])[0]
++        hard, soft = (a, b) if pa >= pb else (b, a)
++        delta = dr(a["p"], b["p"])
++        out.append(dict(delta=delta, kt=min(pa, pb) * delta, z=min(pa, pb) / (pa + pb), m=inv_mass(node["p"])))
++        node = hard
++    return out
++
++
++@pytest.fixture(scope="module")
++def sample():
++    rng = np.random.default_rng(7)
++    sizes = [5, 6, 8, 9, 11, 13, 14, 14, 12, 7]
++    p, mask = random_jets(rng, sizes, width=16)
++    return p, mask, sizes, table(p, mask)
++
++
++def test_exclusive_kt_subjets_scales_and_nsubjettiness(sample):
++    p, mask, sizes, t = sample
++    for b, n in enumerate(sizes):
++        parts = p[b, :n]
++        states, scales, root = ref_cluster(parts, 1)
++        pt_i = np.array([kin(v)[0] for v in parts])
++        for K in (2, 3, 4):
++            subs = sorted(states[K], key=lambda s: -kin(s["p"])[0])
++            for k, s in enumerate(subs):
++                assert t[f"kt{K}_m{k+1}"][b] == pytest.approx(inv_mass(s["p"]), rel=1e-6, abs=1e-4)
++                assert t[f"kt{K}_n{k+1}"][b] == len(s["members"])
++                assert t[f"kt{K}_z{k+1}"][b] == pytest.approx(kin(s["p"])[0] / sum(kin(x["p"])[0] for x in subs))
++            for a, c in combinations(range(K), 2):
++                assert t[f"kt{K}_dr{a+1}{c+1}"][b] == pytest.approx(dr(subs[a]["p"], subs[c]["p"]), rel=1e-6)
++                assert t[f"kt{K}_m{a+1}{c+1}"][b] == pytest.approx(inv_mass(subs[a]["p"] + subs[c]["p"]), rel=1e-6)
++            assert t[f"kt_d{K-1}{K}"][b] == pytest.approx(np.sqrt(scales[K]), rel=1e-6)
++            tau = sum(w * min(dr(v, s["p"]) for s in subs) for w, v in zip(pt_i, parts)) / (pt_i.sum() * jo.R0)
++            assert t[f"tau{K}"][b] == pytest.approx(tau, rel=1e-6)
++        tau1 = sum(w * dr(v, root["p"]) for w, v in zip(pt_i, parts)) / (pt_i.sum() * jo.R0)
++        assert t["tau1"][b] == pytest.approx(tau1, rel=1e-6)
++        assert t["tau21"][b] == pytest.approx(t["tau2"][b] / t["tau1"][b])
++        assert t["jet_mass"][b] == pytest.approx(inv_mass(root["p"]), rel=1e-6)
++
++
++def test_energy_correlators_match_explicit_sums(sample):
++    p, mask, sizes, t = sample
++    for b, n in enumerate(sizes):
++        parts = p[b, :n]
++        z = np.array([kin(v)[0] for v in parts])
++        z = z / z.sum()
++        R = np.array([[dr(a, c) if i != j else 0.0 for j, c in enumerate(parts)] for i, a in enumerate(parts)])
++        for beta in (1, 2):
++            e2 = sum(z[i] * z[j] * R[i, j] ** beta for i, j in combinations(range(n), 2))
++            e3 = sum(z[i] * z[j] * z[k] * (R[i, j] * R[i, k] * R[j, k]) ** beta for i, j, k in combinations(range(n), 3))
++            e4 = sum(np.prod(z[list(q)]) * np.prod([R[a, c] for a, c in combinations(q, 2)]) ** beta
++                     for q in combinations(range(n), 4))
++            assert t[f"e2_b{beta}"][b] == pytest.approx(e2, rel=1e-8)
++            assert t[f"e3_b{beta}"][b] == pytest.approx(e3, rel=1e-8)
++            assert t[f"e4_b{beta}"][b] == pytest.approx(e4, rel=1e-7)
++            assert t[f"D2_b{beta}"][b] == pytest.approx(e3 / e2 ** 3, rel=1e-7)
++            assert t[f"C3_b{beta}"][b] == pytest.approx(e4 * e2 / e3 ** 2, rel=1e-6)
++        e2 = sum(z[i] * z[j] * R[i, j] for i, j in combinations(range(n), 2))
++        one_e3 = sum(np.prod(z[list(q)]) * min(R[a, c] for a, c in combinations(q, 2)) for q in combinations(range(n), 3))
++        two_e3 = sum(np.prod(z[list(q)]) * np.prod(sorted(R[a, c] for a, c in combinations(q, 2))[:2])
++                     for q in combinations(range(n), 3))
++        two_e4 = sum(np.prod(z[list(q)]) * np.prod(sorted(R[a, c] for a, c in combinations(q, 2))[:2])
++                     for q in combinations(range(n), 4))
++        assert t["N2_b1"][b] == pytest.approx(two_e3 / e2 ** 2, rel=1e-7)
++        assert t["N3_b1"][b] == pytest.approx(two_e4 / one_e3 ** 2, rel=1e-7)
++
++
++def test_primary_lund_plane_and_soft_drop(sample):
++    p, mask, sizes, t = sample
++    for b, n in enumerate(sizes):
++        _, _, root = ref_cluster(p[b, :n], 0)
++        primary = ref_primary(root)
++        assert t["lund_n_primary"][b] == len(primary)
++        for e, s in enumerate(primary[:jo.LUND_EMISSIONS]):
++            for key in ("delta", "kt", "z"):
++                assert t[f"lund{e+1}_{key}"][b] == pytest.approx(s[key], rel=1e-6)
++        hardest = max(primary, key=lambda s: s["kt"])
++        assert t["lund_hardest_kt"][b] == pytest.approx(hardest["kt"], rel=1e-6)
++        for threshold in jo.LUND_KT_THRESHOLDS:
++            assert t[f"lund_n_kt{threshold:g}"][b] == sum(s["kt"] > threshold for s in primary)
++        passing = [(i, s) for i, s in enumerate(primary) if s["z"] >= jo.SOFTDROP_ZCUT]
++        if passing:
++            i, s = passing[0]
++            assert t["sd_mass"][b] == pytest.approx(s["m"], rel=1e-6)
++            assert t["sd_zg"][b] == pytest.approx(s["z"], rel=1e-6)
++            assert t["sd_rg"][b] == pytest.approx(s["delta"], rel=1e-6)
++            assert t["sd_ndrop"][b] == i
++        else:
++            assert t["sd_mass"][b] == 0 and t["sd_ndrop"][b] == len(primary)
++
++
++def test_pull_matches_definition(sample):
++    p, mask, sizes, t = sample
++    for b, n in enumerate(sizes):
++        parts = p[b, :n]
++        states, _, root = ref_cluster(parts, 1)
++
++        def pull(members, axis):
++            apt, ay, aphi = kin(axis)
++            vec = np.zeros(2)
++            for i in members:
++                pt, y, phi = kin(parts[i])
++                r = np.array([y - ay, (phi - aphi + np.pi) % (2 * np.pi) - np.pi])
++                vec += pt * np.hypot(*r) / apt * r
++            return vec
++
++        assert t["jet_pull"][b] == pytest.approx(np.hypot(*pull(range(n), root["p"])), rel=1e-6)
++        subs = sorted(states[2], key=lambda s: -kin(s["p"])[0])
++        for a, c in ((0, 1), (1, 0)):
++            vec = pull(subs[a]["members"], subs[a]["p"])
++            _, ya, pa = kin(subs[a]["p"])
++            _, yc, pc = kin(subs[c]["p"])
++            link = np.array([yc - ya, (pc - pa + np.pi) % (2 * np.pi) - np.pi])
++            assert t[f"pull{a+1}_mag"][b] == pytest.approx(np.hypot(*vec), rel=1e-6, abs=1e-12)
++            if np.hypot(*vec) > 0:
++                angle = np.arccos(np.clip(vec @ link / (np.hypot(*vec) * np.hypot(*link)), -1, 1))
++                assert t[f"pull{a+1}{c+1}_angle"][b] == pytest.approx(angle, abs=1e-6)
++
++
++def test_invariant_under_permutation_padding_rotation_and_boost():
++    rng = np.random.default_rng(3)
++    p, mask = random_jets(rng, [9, 17, 30, 4], width=32)
++    base, names = jo.compute_batch(p, mask)
++    order = np.stack([rng.permutation(32) for _ in range(4)])
++    shuffled, _ = jo.compute_batch(np.take_along_axis(p, order[..., None], 1), np.take_along_axis(mask, order, 1))
++    np.testing.assert_allclose(shuffled, base, rtol=1e-6, atol=1e-9)
++    padded, _ = jo.compute_batch(np.pad(p, ((0, 0), (0, 20), (0, 0))), np.pad(mask, ((0, 0), (0, 20))))
++    np.testing.assert_allclose(padded, base, rtol=1e-9, atol=1e-12)
++    angle, rapidity = 1.234, 0.7
++    c, s, ch, sh = np.cos(angle), np.sin(angle), np.cosh(rapidity), np.sinh(rapidity)
++    moved = p.copy()
++    moved[..., 0], moved[..., 1] = c * p[..., 0] - s * p[..., 1], s * p[..., 0] + c * p[..., 1]
++    moved[..., 2], moved[..., 3] = ch * p[..., 2] + sh * p[..., 3], sh * p[..., 2] + ch * p[..., 3]
++    transformed, _ = jo.compute_batch(moved, mask)
++    np.testing.assert_allclose(transformed, base, rtol=1e-5, atol=1e-7)
++    assert len({name for _, name, _ in names}) == len(names)
++    assert {group for group, _, _ in names} == set(jo.GROUPS)
++
++
++def test_small_and_empty_jets_are_finite_and_ragged_entry_point_matches():
++    rng = np.random.default_rng(11)
++    sizes = [0, 1, 2, 3, 4, 40, 128, 60, 2, 33]
++    p, mask = random_jets(rng, sizes)
++    values, names = jo.compute_batch(p, mask)
++    assert np.isfinite(values).all() and values.shape == (len(sizes), len(names))
++    assert not values[0].any()
++    offsets = np.concatenate(([0], np.cumsum(sizes)))
++    ragged, ragged_names = jo.compute(p[mask], offsets, chunk=3)
++    assert ragged_names == names
++    np.testing.assert_allclose(ragged, values, rtol=2e-5, atol=1e-6)
++    empty, _ = jo.compute(np.zeros((0, 4)), np.zeros(1, dtype=int))
++    assert empty.shape == (0, len(names))
